@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 GYU Image Decoder for Retouch Engine
+Supports 8-bit palette, 24-bit, and 32-bit images with separate alpha channel.
 """
 import struct
 import sys
@@ -263,9 +264,8 @@ def decode_gyu(filepath: str) -> dict:
     if data[0:4] != b'GYU\x1a':
         raise ValueError("Not a GYU file")
 
-    # Correct header parsing!
-    flags = struct.unpack('<H', data[4:6])[0] # 16-bit
-    type_ = struct.unpack('<H', data[6:8])[0] # 16-bit
+    flags = struct.unpack('<H', data[4:6])[0]
+    type_ = struct.unpack('<H', data[6:8])[0]
     key = struct.unpack('<I', data[8:12])[0]
     bpp = struct.unpack('<I', data[12:16])[0]
     width = struct.unpack('<I', data[16:20])[0]
@@ -282,34 +282,63 @@ def decode_gyu(filepath: str) -> dict:
     print(f"  Data: {data_size}, Alpha: {alpha_size}, Palette: {pal_colors}")
 
     header_size = 36
-    pal_size = pal_colors * 4
-    compressed_start = header_size + pal_size
 
+    # Parse palette (BGRA format, 4 bytes each)
+    palette = None
+    pal_size = pal_colors * 4
+    if pal_colors > 0:
+        palette = []
+        for i in range(pal_colors):
+            offset = header_size + i * 4
+            b = data[offset]
+            g = data[offset + 1]
+            r = data[offset + 2]
+            # a = data[offset + 3]  # Usually 0, ignore
+            palette.append((r, g, b))
+
+    compressed_start = header_size + pal_size
     compressed = bytearray(data[compressed_start:compressed_start + data_size])
 
-    bytes_per_pixel = bpp // 8
+    alpha_compressed = None
+    if alpha_size > 0:
+        alpha_start = compressed_start + data_size
+        alpha_compressed = bytearray(data[alpha_start:alpha_start + alpha_size])
+
+    # Row stride
+    bytes_per_pixel = bpp // 8 if bpp >= 8 else 1
     row_stride = ((width * bytes_per_pixel) + 3) & ~3
     expected_size = row_stride * height
 
+    # Unscramble
     if key != 0:
-        print(f"  Unscrambling compressed data...")
+        print("  Unscrambling compressed data...")
         unscramble(compressed, key, len(compressed))
 
-    TYPE_GYU_COMPRESSION = 0x0800
+    # Decompress RGB
+    TYPE_GYU = 0x0800
 
     if data_size == expected_size:
-        # No compression
         rgb_data = bytes(compressed)
-    elif type_ == TYPE_GYU_COMPRESSION:
-        # Skip first 4 bytes, use ungyu
+    elif type_ == TYPE_GYU:
         print("  Decompressing with ungyu (LZSS2)...")
         rgb_data = decompress_lzss2(bytes(compressed[4:]), expected_size)
     else:
-        # Standard LZSS
         print("  Decompressing with LZSS...")
         rgb_data = decompress_lzss(bytes(compressed), expected_size)
 
     print(f"  Decompressed: {len(rgb_data)} bytes")
+
+    # Decompress alpha
+    alpha_data = None
+    if alpha_compressed:
+        alpha_stride = (width + 3) & ~3
+        alpha_expected = alpha_stride * height
+
+        if alpha_size == alpha_expected:
+            alpha_data = bytes(alpha_compressed)
+        else:
+            print("  Decompressing alpha...")
+            alpha_data = decompress_lzss(bytes(alpha_compressed), alpha_expected)
 
     return {
         'width': width,
@@ -317,8 +346,9 @@ def decode_gyu(filepath: str) -> dict:
         'bpp': bpp,
         'row_stride': row_stride,
         'rgb': rgb_data,
-        'alpha': None,
-        'flags': flags
+        'alpha': alpha_data,
+        'flags': flags,
+        'palette': palette
     }
 
 def unscramble(data: bytearray, seed: int, size: int):
@@ -333,7 +363,6 @@ def unscramble(data: bytearray, seed: int, size: int):
             data[idx1], data[idx2] = data[idx2], data[idx1]
 
 def gyu_to_png(gyu_path: str, png_path: str = None):
-    """Convert GYU to PNG"""
     if Image is None:
         print("PIL not available!")
         return
@@ -349,12 +378,67 @@ def gyu_to_png(gyu_path: str, png_path: str = None):
     stride = info['row_stride']
     rgb = info['rgb']
     alpha = info['alpha']
+    palette = info.get('palette')
+    flags = info.get('flags', 0)
 
-    if bpp == 24:
-        img = Image.new('RGB', (width, height))
+    # Wide alpha: flags == 0x0003 (not &)
+    wide_alpha = (flags == 0x0003)
+
+    if bpp == 8:
+        # Paletted image
+        if not palette:
+            print(f"  Error: 8-bit image but no palette!")
+            return
+
+        # Alpha stride = (width + 3) & ~3
+        alpha_stride = (width + 3) & ~3
+
+        if alpha:
+            img = Image.new('RGBA', (width, height))
+        else:
+            img = Image.new('RGB', (width, height))
+
         pixels = []
 
         for y in range(height - 1, -1, -1):  # Bottom-up
+            row_start = y * stride
+            alpha_row_start = y * alpha_stride
+
+            for x in range(width):
+                # RGB from palette
+                idx_offset = row_start + x
+                if idx_offset < len(rgb):
+                    pal_idx = rgb[idx_offset]
+                    if pal_idx < len(palette):
+                        r, g, b = palette[pal_idx]
+                    else:
+                        r, g, b = 0, 0, 0
+                else:
+                    r, g, b = 0, 0, 0
+
+                if alpha:
+                    a_offset = alpha_row_start + x
+                    if a_offset < len(alpha):
+                        a = alpha[a_offset]
+                # Alpha scaling based on wide_alpha flag
+                        if not wide_alpha:
+                            if a < 16:
+                                a = a * 16
+                            else:
+                                a = 255
+                    else:
+                        a = 255
+                    pixels.append((r, g, b, a))
+                else:
+                    pixels.append((r, g, b))
+
+        img.putdata(pixels)
+
+    elif bpp == 24:
+        img = Image.new('RGB', (width, height))
+        pixels = []
+
+        for y in range(height - 1, -1, -1):
             row_start = y * stride
             for x in range(width):
                 offset = row_start + x * 3
@@ -366,7 +450,6 @@ def gyu_to_png(gyu_path: str, png_path: str = None):
 
         img.putdata(pixels)
 
-        # Add alpha
         if alpha:
             img = img.convert('RGBA')
             alpha_stride = (width + 3) & ~3
@@ -376,11 +459,21 @@ def gyu_to_png(gyu_path: str, png_path: str = None):
                 row_start = y * alpha_stride
                 for x in range(width):
                     offset = row_start + x
-                    alpha_pixels.append(alpha[offset] if offset < len(alpha) else 255)
+                    if offset < len(alpha):
+                        a = alpha[offset]
+                        if not wide_alpha:
+                            if a < 16:
+                                a = a * 16
+                            else:
+                                a = 255
+                    else:
+                        a = 255
+                    alpha_pixels.append(a)
 
             alpha_img = Image.new('L', (width, height))
             alpha_img.putdata(alpha_pixels)
             img.putalpha(alpha_img)
+
     elif bpp == 32:
         img = Image.new('RGBA', (width, height))
         pixels = []
@@ -404,18 +497,49 @@ def gyu_to_png(gyu_path: str, png_path: str = None):
     img.save(png_path)
     print(f"  Saved: {png_path}")
 
-
 if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        print("Usage: gyu_decode.py <file.gyu> [output.png]")
-        sys.exit(1)
+    import os
+    import glob
+    import argparse
 
-    for path in sys.argv[1:]:
-        if path.endswith('.png'):
-            continue
+    parser = argparse.ArgumentParser(description='GYU Image Decoder')
+    parser.add_argument('inputs', nargs='+', help='GYU files or folders to convert')
+    parser.add_argument('-o', '--output', help='Output directory (preserves folder structure)')
+    args = parser.parse_args()
+
+    files_to_process = []
+    input_base = None  # Track base for relative path calculation
+
+    for arg in args.inputs:
+        if os.path.isdir(arg):
+            if input_base is None:
+                input_base = arg
+            for root, dirs, files in os.walk(arg):
+                for f in files:
+                    if f.lower().endswith('.gyu'):
+                        files_to_process.append(os.path.join(root, f))
+        elif os.path.isfile(arg):
+            files_to_process.append(arg)
+        else:
+            files_to_process.extend(glob.glob(arg, recursive=True))
+
+    print(f"Found {len(files_to_process)} GYU file(s)")
+
+    for path in files_to_process:
         try:
-            gyu_to_png(path)
+            # Determine output path
+            if args.output:
+                if input_base:
+                    rel_path = os.path.relpath(path, input_base)
+                else:
+                    rel_path = os.path.basename(path)
+                out_path = os.path.join(args.output, os.path.splitext(rel_path)[0] + '.png')
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            else:
+                out_path = None  # Same dir as input
+
+            gyu_to_png(path, out_path)
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Error processing {path}: {e}")
             import traceback
             traceback.print_exc()
