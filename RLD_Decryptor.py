@@ -2,7 +2,7 @@
 """
 RLD Tool for Yotsuiro Passionato
 Decrypt → Parse → Extract → Translation-Ready Output
-v2: Smarter filtering, better output
+v3: Character ID lookup from defChara.rld
 """
 import struct
 import os
@@ -20,23 +20,32 @@ KNOWN_SEEDS = {
 }
 
 #=============================================================================
-# Command Types
+# Command Types (from game's command table)
 #=============================================================================
 CMD_TYPES = {
+    0x00: 'INIT',
+    0x01: 'DIRECT',
     0x05: 'BLOCK',
     0x0B: 'EXHIBIT',
     0x0C: 'AUTOSAVE',
     0x0D: 'WAIT',
-    0x11: 'JUMP',
-    0x14: 'CONDITION',
-    0x15: 'CHOICE',
+    0x11: 'CHANGESCENARIO',
+    0x14: 'JUMP',
+    0x15: 'QUESTION',
     0x16: 'CALL',
     0x17: 'RETURN',
-    0x18: 'END',
+    0x18: 'TERMINATE',
     0x1C: 'MESSAGE',
-    0x8C: 'END_ALT',
+    0x30: 'CREATECHARACTER',
+    0x31: 'DEFCHARACTER',
+    0x8C: 'EXITSCENARIO',
     0xBF: 'ACTION',
 }
+
+#=============================================================================
+# Global Character Table (loaded from defChara.rld)
+#=============================================================================
+CHAR_TABLE = {}
 
 #=============================================================================
 # Text Detection
@@ -47,53 +56,36 @@ def contains_japanese(text):
         return False
     for char in text:
         code = ord(char)
-        # Hiragana, Katakana, CJK
-        if (0x3040 <= code <= 0x309F or# Hiragana
+        if (0x3040 <= code <= 0x309F or  # Hiragana
             0x30A0 <= code <= 0x30FF or  # Katakana
             0x4E00 <= code <= 0x9FFF or  # CJK
-            0xFF00 <= code <= 0xFFEF):# Fullwidth
+            0xFF00 <= code <= 0xFFEF):   # Fullwidth
             return True
     return False
 
 def is_translatable_text(text):
-    """Check if text is worth translating (not just commands/params)"""
+    """Check if text is worth translating"""
     if not text:
         return False
-
-    # Skip if too short
     if len(text) < 2:
         return False
-
-    # Skip if it's just numbers, commas, operators
     if re.match(r'^[\d,\-\.\*\s\;\:\&\|\=\<\>\[\]\(\)RQLSrqls]+$', text):
         return False
-
-    # Skip if starts with common command patterns
     skip_starts = ['-1,', '0,', '1,', '10,', '100,', '101,', '102,', '2000,']
     for pattern in skip_starts:
         if text.startswith(pattern) and not contains_japanese(text):
             return False
-
-    # Must contain actual text characters
     return contains_japanese(text) or re.search(r'[a-zA-Z]{3,}', text)
 
 def extract_label_text(label_string):
     """Extract translatable portion from LABEL string"""
-    # LABELs often look like: "-1,33554432,-1,*,0,0,プロローグ／１日目"
-    # The translatable part is usually at the end
-
     if not label_string:
         return None
-
-    # Split by comma
     parts = label_string.split(',')
-
-    # Check last parts for Japanese text
     for i in range(len(parts) - 1, -1, -1):
         part = parts[i].strip()
         if contains_japanese(part) and part != '*':
             return part
-
     return None
 
 #=============================================================================
@@ -204,7 +196,8 @@ def parse_rld(data):
             'offset': cmd_start,
             'type': cmd_type,
             'type_name': CMD_TYPES.get(cmd_type, f'CMD_{cmd_type:02X}'),
-            'params': [],'strings': []
+            'params': [],
+            'strings': []
         }
 
         for _ in range(dword_count):
@@ -225,14 +218,36 @@ def parse_rld(data):
     return commands
 
 #=============================================================================
-# Text Extraction - Smarter Filtering
+# Parse defChara.rld for Character ID → Name mapping
+#=============================================================================
+def parse_defchara(data):
+    """Parse defChara.rld to extract character ID → name mapping"""
+    global CHAR_TABLE
+
+    commands = parse_rld(data)
+
+    for cmd in commands:
+        # CMD_CREATECHARACTER (0x30) contains character definitions
+        if cmd['type'] == 0x30 and cmd['strings']:
+            # Format: "CharID,??,??,Name,,,,,,,,,,"
+            parts = cmd['strings'][0].split(',')
+            if len(parts) >= 4 and parts[0].isdigit():
+                char_id = int(parts[0])
+                char_name = parts[3].strip()
+                if char_name:
+                    CHAR_TABLE[char_id] = char_name
+
+    return CHAR_TABLE
+
+#=============================================================================
+# Text Extraction with Character ID Support
 #=============================================================================
 def extract_translatable(commands, filename):
-    """Extract only translatable text from commands"""
+    """Extract translatable text with proper speaker names"""
     entries = []
 
     for i, cmd in enumerate(commands):
-        if cmd['type'] == 0x1C:  # MESSAGE - Always include
+        if cmd['type'] == 0x1C:  # MESSAGE
             if not cmd['strings']:
                 continue
 
@@ -242,19 +257,40 @@ def extract_translatable(commands, filename):
                 'type': 'MESSAGE',
                 'speaker': None,
                 'text': None,
+                'char_id': 0,
             }
 
+            # Get character ID from params (it's just params[0] directly)
+            char_id = 0
+            if cmd['params']:
+                char_id = cmd['params'][0]
+            entry['char_id'] = char_id
+
+            # Parse strings
+            inline_name = None
             if len(cmd['strings']) >= 2:
-                speaker = cmd['strings'][0]
-                entry['speaker'] = speaker if speaker and speaker != '*' else None
+                if cmd['strings'][0] and cmd['strings'][0] != '*':
+                    inline_name = cmd['strings'][0]
                 entry['text'] = cmd['strings'][-1]
             elif len(cmd['strings']) == 1:
                 entry['text'] = cmd['strings'][0]
 
+            # Determine speaker:
+            # 1. Inline name (explicit in script)
+            # 2. CharID >= 3 lookup (from defChara.rld)
+            # 3. CharID 1-2: protagonist thoughts (no name shown)
+            # 4. CharID 0: narration (no speaker)
+
+            if inline_name:
+                entry['speaker'] = inline_name
+            elif char_id >= 3 and char_id in CHAR_TABLE:
+                entry['speaker'] = CHAR_TABLE[char_id]
+            # else: no speaker (narration or protagonist inner thoughts)
+
             if entry['text'] and is_translatable_text(entry['text']):
                 entries.append(entry)
 
-        elif cmd['type'] == 0x05:  # BLOCK - Only if has translatable label
+        elif cmd['type'] == 0x05:  # BLOCK - new scene
             if cmd['strings']:
                 raw_label = cmd['strings'][-1] if cmd['strings'] else ''
                 extracted = extract_label_text(raw_label)
@@ -265,10 +301,10 @@ def extract_translatable(commands, filename):
                         'index': i,
                         'type': 'LABEL',
                         'text': extracted,
-                        'raw': raw_label,  # Keep raw for JSON
+                        'raw': raw_label,
                     })
 
-        elif cmd['type'] == 0x15:  # CHOICE
+        elif cmd['type'] == 0x15:  # QUESTION/CHOICE
             for j, opt in enumerate(cmd['strings']):
                 if opt and opt != '*' and is_translatable_text(opt):
                     entries.append({
@@ -277,14 +313,14 @@ def extract_translatable(commands, filename):
                         'type': f'CHOICE_{j}',
                         'text': opt,})
 
-        elif cmd['type'] == 0x11:  # JUMP - Keep in JSON only
+        elif cmd['type'] == 0x11:  # CHANGESCENARIO
             if cmd['strings']:
                 entries.append({
                     'file': filename,
                     'index': i,
                     'type': 'JUMP',
                     'target': cmd['strings'][0],
-                    '_no_tsv': True,  # Skip in TSV export
+                    '_no_tsv': True,
                 })
 
     return entries
@@ -293,13 +329,12 @@ def extract_translatable(commands, filename):
 # Export Functions
 #=============================================================================
 def export_tsv(all_entries, output_path):
-    """Export ONLY translatable text to TSV"""
+    """Export translatable text to TSV"""
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write("# Yotsuiro Passionato Translation File\n")
         f.write("# Save as UTF-8!\n")
         f.write("#\n")
-        f.write("# Columns: FILE | INDEX | TYPE | ORIGINAL | TRANSLATION\n")
-        f.write("# Fill in the TRANSLATION column\n")
+        f.write("# Leave NAME translation empty to use unique_names.tsv\n")
         f.write("#\n")
         f.write("FILE\tINDEX\tTYPE\tORIGINAL\tTRANSLATION\n")
 
@@ -307,13 +342,7 @@ def export_tsv(all_entries, output_path):
         count = 0
 
         for entry in all_entries:
-            # Skip entries marked as non-TSV
             if entry.get('_no_tsv'):
-                continue
-
-            # Skip non-translatable
-            text = entry.get('text') or entry.get('speaker')
-            if not text:
                 continue
 
             if entry['file'] != current_file:
@@ -321,10 +350,13 @@ def export_tsv(all_entries, output_path):
                 f.write(f"#\n# === {current_file} ===\n#\n")
 
             if entry['type'] == 'MESSAGE':
+                # Output NAME if speaker exists
                 if entry.get('speaker'):
                     speaker_escaped = entry['speaker'].replace('\n', '\\n').replace('\t', '\\t')
                     f.write(f"{entry['file']}\t{entry['index']}\tNAME\t{speaker_escaped}\t\n")
                     count += 1
+
+                # ALWAYS output TEXT (not inside else!)
                 if entry.get('text'):
                     text_escaped = entry['text'].replace('\n', '\\n').replace('\t', '\\t')
                     f.write(f"{entry['file']}\t{entry['index']}\tTEXT\t{text_escaped}\t\n")
@@ -343,8 +375,7 @@ def export_tsv(all_entries, output_path):
     return count
 
 def export_json(all_entries, output_path):
-    """Export full data to JSON (for developers/tools)"""
-    # Clean up internal flags before export
+    """Export full data to JSON"""
     clean_entries = []
     for entry in all_entries:
         clean = {k: v for k, v in entry.items() if not k.startswith('_')}
@@ -378,38 +409,48 @@ def export_txt(entries, output_path):
                 idx = entry['type'].split('_')[1]
                 f.write(f"[{idx}] {entry['text']}\n")
 
-#=============================================================================
-# Unique Strings Export (for global translation)
-#=============================================================================
-def export_unique_strings(all_entries, output_dir):
-    """Export unique speaker names for global translation"""
-    unique_names = {}
+def export_unique_names(all_entries, output_path):
+    """Export ALL unique speaker names (inline + defChara)"""
+    unique_names = set()
 
+    # Collect from script entries (inline names)
     for entry in all_entries:
         if entry.get('_no_tsv'):
             continue
-        if entry['type'] == 'MESSAGE' and entry.get('speaker') and entry['speaker'] != '*':
+        if entry['type'] == 'MESSAGE' and entry.get('speaker'):
             name = entry['speaker']
-            if name not in unique_names:
-                unique_names[name] =0
-            unique_names[name] += 1
+            if name:
+                unique_names.add(name)
 
-    # Export unique names (simple2-column format)
-    names_path = output_dir / 'unique_names.tsv'
-    with open(names_path, 'w', encoding='utf-8') as f:
-        f.write("# Global character names - fill in TRANSLATION column\n")
-        f.write("# Format: ORIGINAL<TAB>TRANSLATION\n")
+    # Add names from CHAR_TABLE (defChara.rld)
+    for char_id, name in CHAR_TABLE.items():
+        if name:
+            unique_names.add(name)
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write("# Character names - fill TRANSLATION column\n")
+        f.write("# Includes names from scripts AND defChara.rld\n")
         f.write("#\n")
-        for name, count in sorted(unique_names.items()):
-            # Empty translation for user to fill
+        f.write("ORIGINAL\tTRANSLATION\n")
+
+        for name in sorted(unique_names):
             f.write(f"{name}\t\n")
 
     return len(unique_names)
 
+def export_char_table(output_path):
+    """Export character table for reference"""
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write("# Character ID Table (from defChara.rld)\n")
+        f.write("# ID<TAB>Name\n")
+        f.write("#\n")
+        for char_id, name in sorted(CHAR_TABLE.items()):
+            f.write(f"{char_id}\t{name}\n")
+
 #=============================================================================
-# Main Processing
+# File Processing
 #=============================================================================
-def process_file(filepath, keys, output_dirs):
+def process_file(filepath, keys, output_dirs, is_defchara=False):
     """Process single RLD file"""
     filename = Path(filepath).stem
 
@@ -421,11 +462,16 @@ def process_file(filepath, keys, output_dirs):
 
     decrypted = decrypt_rld(data, keys)
 
-    # Save decrypted (optional)
+    # Save decrypted
     if output_dirs.get('dec'):
         dec_path = output_dirs['dec'] / f"{filename}.rld.dec"
         with open(dec_path, 'wb') as f:
             f.write(decrypted)
+
+    # Parse defChara specially
+    if is_defchara:
+        parse_defchara(decrypted)
+        return [], f"parsed {len(CHAR_TABLE)} characters"
 
     commands = parse_rld(decrypted)
     entries = extract_translatable(commands, filename)
@@ -438,33 +484,37 @@ def process_file(filepath, keys, output_dirs):
     msg_count = sum(1 for e in entries if e['type'] == 'MESSAGE')
     return entries, f"{len(commands)} cmds, {msg_count} msgs"
 
+#=============================================================================
+# Main
+#=============================================================================
 def main():
     if len(sys.argv) < 2:
         print("""
 ╔══════════════════════════════════════════════════════════════╗
-║         RLD Tool v2- Yotsuiro Passionato                ║
+║         RLD Tool v3 - Yotsuiro Passionato                    ║
 ╠══════════════════════════════════════════════════════════════╣
-║  • Decrypts RLD files                ║
-║  • Extracts ONLY translatable text                           ║
-║  • Filters out script commands/junk                          ║
-║  • Exports unique strings for global translation             ║
+║  • Decrypts RLD files                                        ║
+║  • Parses defChara.rld for character names                   ║
+║  • Resolves character IDs → actual names                     ║
+║  • Exports translation-ready TSV/JSON                        ║
 ╚══════════════════════════════════════════════════════════════╝
 
 Usage: python rld_tool.py <rld_folder> [output_folder]
 
 Output:
-  output/├── decrypted/Raw .dec files
-    ├── text/               Readable .txt files
-    ├── translation.tsv     ← Edit this! (clean, translatable only)
-    ├── translation.json    Full data for tools├── unique_names.tsv    Speaker names (translate once)
-    └── unique_texts.tsv    All unique lines
+  output/
+    ├── decrypted/          Raw .dec files
+    ├── text/               Readable .txt scripts
+    ├── translation.tsv     ← Main translation file
+    ├── translation.json    Full data for tools
+    ├── unique_names.tsv    Speaker names (translate once)
+    └── char_table.tsv      Character ID reference
 """)
         return
 
     input_dir = Path(sys.argv[1])
     output_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else Path('output')
 
-    # Create output directories
     output_dirs = {
         'dec': output_dir / 'decrypted',
         'txt': output_dir / 'text',
@@ -479,15 +529,33 @@ Output:
         key_tables[name] = generate_key_table(seed)
         print(f"    {name}: 0x{seed:08X}")
 
-    # Find RLD files
+    # Find all RLD files
     rld_files = sorted(input_dir.glob('*.rld'))
-    print(f"\n[*] Found {len(rld_files)} RLD files\n")
+    print(f"\n[*] Found {len(rld_files)} RLD files")
 
-    # Process all files
+    # Process defChara.rld FIRST
+    defchara_file = input_dir / 'defChara.rld'
+    if defchara_file.exists():
+        print(f"\n[*] Processing defChara.rld first...")
+        keys = key_tables.get('_default')
+        _, msg = process_file(defchara_file, keys, output_dirs, is_defchara=True)
+        print(f"    {msg}")
+        for cid, name in list(CHAR_TABLE.items())[:5]:
+            print(f"      {cid}: {name}")
+        if len(CHAR_TABLE) > 5:
+            print(f"      ... and {len(CHAR_TABLE) - 5} more")
+    else:
+        print("\n[!] defChara.rld not found - character IDs won't be resolved")
+
+    # Process all other files
+    print(f"\n[*] Processing script files...\n")
     all_entries = []
     stats = {'ok': 0, 'messages': 0}
 
     for rld_file in rld_files:
+        if rld_file.name.lower() == 'defchara.rld':
+            continue  # Already processed
+
         filename = rld_file.name.lower()
         keys = key_tables.get(filename, key_tables.get('_default'))
 
@@ -510,22 +578,29 @@ Output:
     export_json(all_entries, json_path)
     print(f"    {json_path}")
 
-    unique_names = export_unique_strings(all_entries, output_dir)
-    print(f"    unique_names.tsv ({unique_names} names)")
+    names_path = output_dir / 'unique_names.tsv'
+    unique_count = export_unique_names(all_entries, names_path)
+    print(f"    {names_path} ({unique_count} unique names)")
+
+    if CHAR_TABLE:
+        char_path = output_dir / 'char_table.tsv'
+        export_char_table(char_path)
+        print(f"    {char_path} ({len(CHAR_TABLE)} characters)")
 
     # Summary
     print(f"""
 {'='*60}
 COMPLETE!
-  Files: {stats['ok']}
-  Messages: {stats['messages']}
-  Unique names: {unique_names}
+  Files processed: {stats['ok']}
+  Total messages: {stats['messages']}
+  Unique speakers: {unique_count}
+  Character IDs: {len(CHAR_TABLE)}
 
-For translation:
-  1. Edit unique_names.tsv (each name translated once)
-  2. Edit translation.tsv (all dialogue)
-  3. Copy translation.tsv to game folder
-  4. Run game with dinput8.dll hook
+Translation workflow:
+  1. Edit unique_names.tsv (global name translations)
+  2. Edit translation.tsv (dialogue)
+  3. Copy both to game folder
+  4. Run game with hook
 {'='*60}
 """)
 
