@@ -19,15 +19,27 @@
 #pragma comment(lib, "psapi.lib")
 
 //=============================================================================
+// Function Offsets (ImageBase 0x10000000)
+//=============================================================================
+namespace Offsets {
+    constexpr uintptr_t AdvCharSay = 0x00039A10; // RetouchAdvCharacter::say()
+    constexpr uintptr_t PrintEx    = 0x00049A50; // RetouchPrintManager::printEx()
+    constexpr uintptr_t SaveDataTitle     = 0x0004D470; // RetouchSaveDataControl::title()
+    constexpr uintptr_t SaveDataIsValid   = 0x0004C210; // RetouchSaveDataControl::isValid()
+    constexpr uintptr_t SaveDataGetItem   = 0x0004C2E0; // RetouchSaveDataControl::getItem()
+    constexpr uintptr_t PrepareQuestion   = 0x000A5A20; // RetouchSystem::prepareQuestion()
+}
+
+//=============================================================================
 // Configuration
 //=============================================================================
 namespace Config {
     // File paths
-    char translationFile[MAX_PATH] = ".\\translation.tsv";
-    char namesFile[MAX_PATH] = ".\\unique_names.tsv";
-    char charIdFile[MAX_PATH] = ".\\char_table.tsv";
+    char translationFile[MAX_PATH] = ".\\tl\\translation.tsv";
+    char namesFile[MAX_PATH] = ".\\tl\\unique_names.tsv";
+    char charIdFile[MAX_PATH] = ".\\tl\\char_table.tsv";
     char configFile[MAX_PATH] = ".\\yotsuiro_tl.ini";
-    char untranslatedLog[MAX_PATH] = ".\\untranslated.tsv";
+    char untranslatedLog[MAX_PATH] = ".\\tl\\untranslated.tsv";
 
     // General
     bool enableConsole = true;
@@ -35,7 +47,7 @@ namespace Config {
     bool dumpUntranslated = false;
 
     // Text
-    int wordWrapWidth = 75;
+    int wordWrapWidth = 70;
 
     // Hotkeys
     int reloadHotkey = VK_F5;
@@ -43,6 +55,11 @@ namespace Config {
     // Font
     char fontName[64] = "";
     char fontNameProportional[64] = "";
+
+    // Asset redirection
+    bool enableAssetRedirect = true;
+    bool logAssetRedirects = false;
+    char tlAssetsPath[MAX_PATH] = ".\\tl\\assets\\";
 }
 
 //=============================================================================
@@ -87,9 +104,20 @@ static void SaveDefaultConfig() {
 
     fprintf(f, "[Files]\n");
     fprintf(f, "; Translation file paths (relative to game folder)\n");
-    fprintf(f, "TranslationFile=.\\translation.tsv\n");
-    fprintf(f, "NamesFile=.\\unique_names.tsv\n");
-    fprintf(f, "CharIdFile=.\\char_table.tsv\n");
+    fprintf(f, "TranslationFile=.\\tl\\translation.tsv\n");
+    fprintf(f, "NamesFile=.\\tl\\unique_names.tsv\n");
+    fprintf(f, "CharIdFile=.\\tl\\char_table.tsv\n");
+    fprintf(f, "\n");
+
+    fprintf(f, "[Assets]\n");
+    fprintf(f, "; Enable asset redirection from tl/assets folder\n");
+    fprintf(f, "EnableRedirect=true\n");
+    fprintf(f, "\n");
+    fprintf(f, "; Log asset redirects to console\n");
+    fprintf(f, "LogRedirects=false\n");
+    fprintf(f, "\n");
+    fprintf(f, "; Path to replacement assets (supports .gyu and .png)\n");
+    fprintf(f, "Path=.\\tl\\assets\\\n");
     fprintf(f, "\n");
 
     fclose(f);
@@ -141,9 +169,20 @@ static void LoadConfig() {
     ReadString("Font", "NameProportional", "", Config::fontNameProportional, sizeof(Config::fontNameProportional));
 
     // Files
-    ReadString("Files", "TranslationFile", ".\\translation.tsv", Config::translationFile, sizeof(Config::translationFile));
-    ReadString("Files", "NamesFile", ".\\unique_names.tsv", Config::namesFile, sizeof(Config::namesFile));
-    ReadString("Files", "CharIdFile", ".\\char_table.tsv", Config::charIdFile, sizeof(Config::charIdFile));
+    ReadString("Files", "TranslationFile", ".\\tl\\translation.tsv", Config::translationFile, sizeof(Config::translationFile));
+    ReadString("Files", "NamesFile", ".\\tl\\unique_names.tsv", Config::namesFile, sizeof(Config::namesFile));
+    ReadString("Files", "CharIdFile", ".\\tl\\char_table.tsv", Config::charIdFile, sizeof(Config::charIdFile));
+
+    // Asset Redirection
+    Config::enableAssetRedirect = ReadBool("Assets", "EnableRedirect", true);
+    Config::logAssetRedirects = ReadBool("Assets", "LogRedirects", false);
+    ReadString("Assets", "Path", ".\\tl\\assets\\", Config::tlAssetsPath, sizeof(Config::tlAssetsPath));
+
+    // Ensure path ends with backslash
+    size_t len = strlen(Config::tlAssetsPath);
+    if (len > 0 && Config::tlAssetsPath[len - 1] != '\\') {
+        strcat_s(Config::tlAssetsPath, "\\");
+    }
 
     // Log
     Log("[CONFIG] Loaded from %s\n", Config::configFile);
@@ -300,17 +339,68 @@ namespace Encoding {
 }
 
 //=============================================================================
-// Function Offsets (ImageBase 0x10000000)
+// Asset Redirection
 //=============================================================================
-namespace Offsets {
-    constexpr uintptr_t AdvCharSay = 0x00039A10;
-    constexpr uintptr_t PrintEx    = 0x00049A50;
+namespace AssetRedirect {
+    static bool FileExists(const char* path) {
+        DWORD attr = GetFileAttributesA(path);
+        return (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY));
+    }
 
-    constexpr uintptr_t LoadRld    = 0x000C1010;
+    static std::string GetFileName(const std::string& path) {
+        size_t pos = path.find_last_of("\\/");
+        return (pos != std::string::npos) ? path.substr(pos + 1) : path;
+    }
 
-    constexpr uintptr_t SaveDataTitle     = 0x0004D470;
-    constexpr uintptr_t SaveDataIsValid   = 0x0004C210;
-    constexpr uintptr_t SaveDataGetItem   = 0x0004C2E0;
+    static std::string GetRelativePath(const std::string& fullPath) {
+        // Look for "res\" in the path
+        size_t resPos = fullPath.find("res\\");
+        if (resPos != std::string::npos) {
+            return fullPath.substr(resPos + 4);
+        }
+        return GetFileName(fullPath);
+    }
+
+    static std::string FindReplacement(const std::string& originalPath) {
+        if (!Config::enableAssetRedirect) return "";
+
+        std::string relativePath = GetRelativePath(originalPath);
+        std::string assetsPath = Config::tlAssetsPath;
+
+        // Try 1: Exact path (tl/assets/g/ev/xxx.gyu)
+        std::string tryPath = assetsPath + relativePath;
+        if (FileExists(tryPath.c_str())) {
+            return tryPath;
+        }
+
+        // Try 2: PNG version of exact path
+        size_t extPos = tryPath.rfind(".gyu");
+        if (extPos != std::string::npos) {
+            std::string pngPath = tryPath.substr(0, extPos) + ".png";
+            if (FileExists(pngPath.c_str())) {
+                return pngPath;
+            }
+        }
+
+        // Try 3: Flat structure (tl/assets/xxx.gyu)
+        std::string filename = GetFileName(originalPath);
+        tryPath = assetsPath + filename;
+        if (FileExists(tryPath.c_str())) {
+            return tryPath;
+        }
+
+        // Try 4: Flat PNG (tl/assets/xxx.png)
+        extPos = filename.rfind(".gyu");
+        if (extPos != std::string::npos) {
+            std::string pngName = filename.substr(0, extPos) + ".png";
+            tryPath = assetsPath + pngName;
+            if (FileExists(tryPath.c_str())) {
+                return tryPath;
+            }
+        }
+
+        return "";
+    }
 }
 
 //=============================================================================
@@ -385,6 +475,7 @@ public:
         int globalCount = 0;
         int contextualCount = 0;
         int textCount = 0;
+        int choiceCount = 0;
         int labelCount = 0;
 
         // === STEP 1: Load global names from unique_names.tsv ===
@@ -448,6 +539,9 @@ public:
             } else if (type == "LABEL") {
                 m_labels[original] = translated;
                 labelCount++;
+            } else if (type.rfind("CHOICE_", 0) == 0) {
+                m_messages[original] = translated;
+                choiceCount++;
             }
         }
 
@@ -480,6 +574,7 @@ public:
         Log("[TL]   %d global names (from %s)\n", globalCount, namesPath ? namesPath : "none");
         Log("[TL]   %d contextual names (from %s)\n", contextualCount, tsvPath);
         Log("[TL]   %d texts\n", textCount);
+        Log("[TL]   %d choices\n", choiceCount);
         Log("[TL]   %d labels\n", labelCount);
 
         return true;
@@ -539,6 +634,7 @@ public:
     }
 
     // Label
+    // Label lookup - with [X] suffix fallback
     const std::string* FindLabelTranslation(const char* sjisLabel) {
         if (!sjisLabel || !*sjisLabel) return nullptr;
 
@@ -547,14 +643,26 @@ public:
 
         std::lock_guard<std::mutex> lock(m_dataMutex);
 
+        // Try exact match first
         auto it = m_labels.find(utf8Key);
         if (it != m_labels.end()) {
             return &it->second;
         }
 
+        // Save files don't include [X] suffix, but TSV does
+        // Try appending " [1]", " [2]", etc.
+        for (int i = 1; i <= 30; i++) { // just 30 to be safe.
+            std::string withSuffix = utf8Key + " [" + std::to_string(i) + "]";
+            it = m_labels.find(withSuffix);
+            if (it != m_labels.end()) {
+                return &it->second;
+            }
+        }
+
         LogMissing(utf8Key.c_str(), "LABEL");
         return nullptr;
     }
+
 
 private:
     void UnescapeString(std::string& s) {
@@ -827,7 +935,7 @@ static void LoadCharIdTable(const char* path) {
 }
 
 //=============================================================================
-// Hook: RetouchAdvCharacter::say
+// Hook: RetouchAdvCharacter::say()
 //=============================================================================
 typedef void(__thiscall* Fn_AdvCharSay)(
     void* pThis, int voiceId, const char* name, const char* message,
@@ -900,14 +1008,14 @@ static void __fastcall AdvCharSay_Hook(
         std::string msgUtf8 = message ? Encoding::SjisToUtf8(message) : "(null)";
 
         Log("[SAY] voiceId=%d flags=0x%08X\n", voiceId, flags);
-        Log("name=\"%s\"\n", nameUtf8.c_str());
-        Log("      msg=\"%.50s%s\"\n", msgUtf8.c_str(), msgUtf8.length() > 50 ? "..." : "");
+        Log("      name=\"%s\"\n", nameUtf8.c_str());
+        Log("      msg=\"%s\"\n", msgUtf8.c_str());
 
         if (finalName != name || finalMsg != message) {
             std::string tlNameUtf8 = finalName ? Encoding::SjisToUtf8(finalName) : "";
             std::string tlMsgUtf8 = finalMsg ? Encoding::SjisToUtf8(finalMsg) : "";
-            Log("--> name=\"%s\"\n", tlNameUtf8.c_str());
-            Log("--> msg=\"%.50s%s\"\n", tlMsgUtf8.c_str(), tlMsgUtf8.length() > 50 ? "..." : "");
+            Log("  --> name=\"%s\"\n", tlNameUtf8.c_str());
+            Log("  --> msg=\"%s\"\n", tlMsgUtf8.c_str());
         }
     }
 
@@ -915,7 +1023,7 @@ static void __fastcall AdvCharSay_Hook(
 }
 
 //=============================================================================
-// Hook: printEx
+// Hook: RetouchPrintManager::printEx()
 //=============================================================================
 typedef void(__thiscall* Fn_PrintEx)(
     void* pThis, int charId, int msgId, const char* name, const char* message,
@@ -963,8 +1071,12 @@ static int __fastcall SaveDataTitle_Hook(
     void* pThis, void* edx,
     void* fcString, int slotType, int slotIndex, bool useTemplate, unsigned int* outTime)
 {
+    // Debug
+    Log("[SAVE] title() called: type=%d index=%d\n", slotType, slotIndex);
+
     // Check valid
     if (!g_SaveDataIsValid(pThis, slotType, slotIndex)) {
+        Log("[SAVE] Invalid slot\n");
         return g_origSaveDataTitle(pThis, fcString, slotType, slotIndex, useTemplate, outTime);
     }
 
@@ -972,12 +1084,14 @@ static int __fastcall SaveDataTitle_Hook(
 
     // Empty slot - call original
     if (item[0] == 0) {
+        Log("[SAVE] Empty slot\n");
         return g_origSaveDataTitle(pThis, fcString, slotType, slotIndex, useTemplate, outTime);
     }
 
     // Get label
     DWORD labelFCString = item[2];
     const char* labelSjis = *(const char**)(labelFCString + 0x14);
+    Log("[SAVE] Label raw: %p -> \"%s\"\n", labelSjis, labelSjis ? Encoding::SjisToUtf8(labelSjis).c_str() : "(null)");
 
     // Try translate
     const char* finalLabel = labelSjis;
@@ -988,10 +1102,9 @@ static int __fastcall SaveDataTitle_Hook(
         if (translated) {
             translatedSjis = Encoding::Utf8ToSjis(translated->c_str());
             finalLabel = translatedSjis.c_str();
-
-            if (Config::enableTextLogging) {
-                Log("[LABEL] \"%s\" -> \"%s\"\n",Encoding::SjisToUtf8(labelSjis).c_str(), translated->c_str());
-            }
+            Log("[SAVE] Found translation: \"%s\"\n", translated->c_str());
+        } else {
+            Log("[SAVE] No translation found!\n");
         }
     }
 
@@ -1006,6 +1119,36 @@ static int __fastcall SaveDataTitle_Hook(
     *(const char**)(labelFCString + 0x14) = originalPtr;
 
     return result;
+}
+
+//=============================================================================
+// Hook: RetouchSystem::prepareQuestion() (CHOICE translation)
+//=============================================================================
+typedef void(__thiscall* Fn_PrepareQuestion)(void* pThis, int choiceId, const char* text);
+static Fn_PrepareQuestion g_origPrepareQuestion = nullptr;
+
+static void __fastcall PrepareQuestion_Hook(void* pThis, void* edx, int choiceId, const char* text)
+{
+    const char* finalText = text;
+
+    if (text && *text) {
+        const std::string* translated = g_translationDB.FindMessageTranslation(text);
+        if (translated) {
+            std::string sjis = Encoding::Utf8ToSjis(translated->c_str());
+            if (!sjis.empty()) {
+                finalText = g_stringPool.Store(sjis);
+
+                if (Config::enableTextLogging) {
+                    Log("[CHOICE] %d: \"%s\" -> \"%s\"\n",
+                        choiceId,
+                        Encoding::SjisToUtf8(text).c_str(),
+                        translated->c_str());
+                }
+            }
+        }
+    }
+
+    g_origPrepareQuestion(pThis, choiceId, finalText);
 }
 
 //=============================================================================
@@ -1079,6 +1222,42 @@ static HFONT WINAPI CreateFontIndirectA_Hook(const LOGFONTA* lf) {
         return g_origCreateFontIndirectA(&modified);
     }
     return g_origCreateFontIndirectA(lf);
+}
+
+//=============================================================================
+// Hook: CreateFileA - Asset Redirection
+//=============================================================================
+typedef HANDLE(WINAPI* Fn_CreateFileA)(LPCSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurity, DWORD dwCreation,
+    DWORD dwFlags, HANDLE hTemplate
+);
+static Fn_CreateFileA g_origCreateFileA = nullptr;
+
+static HANDLE WINAPI CreateFileA_Hook(
+    LPCSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurity, DWORD dwCreation,
+    DWORD dwFlags, HANDLE hTemplate)
+{
+    if (lpFileName && (dwDesiredAccess & GENERIC_READ)) {
+        const char* ext = strrchr(lpFileName, '.');
+        if (ext && _stricmp(ext, ".gyu") == 0) {
+            std::string replacement = AssetRedirect::FindReplacement(lpFileName);
+            if (!replacement.empty()) {
+                if (Config::logAssetRedirects) {
+                    Log("[ASSET] %s -> %s\n", lpFileName, replacement.c_str());
+                }
+                return g_origCreateFileA(
+                    replacement.c_str(), dwDesiredAccess, dwShareMode,
+                    lpSecurity, dwCreation, dwFlags, hTemplate
+                );
+            }
+        }
+    }
+
+    return g_origCreateFileA(
+        lpFileName, dwDesiredAccess, dwShareMode,
+        lpSecurity, dwCreation, dwFlags, hTemplate
+    );
 }
 
 //=============================================================================
@@ -1241,23 +1420,23 @@ static bool InstallHooks(HMODULE hResident) {
     uintptr_t base = (uintptr_t)hResident;
     Log("[*] resident.dll base: 0x%p\n", (void*)base);
 
-    // Hook say()
+    // Hook RetouchAdvCharacter::say()
     {
         uintptr_t addr = base + Offsets::AdvCharSay;
-        Log("[*] Trying to hook say() at 0x%p\n", (void*)addr);
+        Log("[*] Trying to hook RetouchAdvCharacter::say() at 0x%p\n", (void*)addr);
         if (MH_CreateHook((void*)addr, (void*)&AdvCharSay_Hook, (void**)&g_origAdvCharSay) == MH_OK) {
             MH_EnableHook((void*)addr);
-            Log("[+] say() hooked\n");
+            Log("[+] RetouchAdvCharacter::say() hooked\n");
         }
     }
 
-    // Hook printEx()
+    // Hook RetouchPrintManager::printEx()
     {
         uintptr_t addr = base + Offsets::PrintEx;
-        Log("[*] Trying to hook printEx() at 0x%p\n", (void*)addr);
+        Log("[*] Trying to hook RetouchPrintManager::printEx() at 0x%p\n", (void*)addr);
         if (MH_CreateHook((void*)addr, (void*)&PrintEx_Hook, (void**)&g_origPrintEx) == MH_OK) {
             MH_EnableHook((void*)addr);
-            Log("[+] printEx() hooked\n");
+            Log("[+] RetouchPrintManager::printEx() hooked\n");
         }
     }
 
@@ -1270,6 +1449,16 @@ static bool InstallHooks(HMODULE hResident) {
         if (MH_CreateHook((void*)addr, (void*)&SaveDataTitle_Hook, (void**)&g_origSaveDataTitle) == MH_OK) {
             MH_EnableHook((void*)addr);
             Log("[+] SaveDataTitle() hooked\n");
+        }
+    }
+
+    // Hook RetouchSystem::prepareQuestion() for CHOICE translation
+    {
+        uintptr_t addr = base + Offsets::PrepareQuestion;
+        Log("[*] Trying to hook RetouchSystem::prepareQuestion() at 0x%p\n", (void*)addr);
+        if (MH_CreateHook((void*)addr, (void*)&PrepareQuestion_Hook, (void**)&g_origPrepareQuestion) == MH_OK) {
+            MH_EnableHook((void*)addr);
+            Log("[+] RetouchSystem::prepareQuestion() hooked\n");
         }
     }
 
@@ -1338,8 +1527,31 @@ static bool Initialize() {
         Log("[+] Font hook installed\n");
     }
 
+    // Hook CreateFileA for asset redirection
+    if (Config::enableAssetRedirect) {
+        // Create assets directory if needed
+        CreateDirectoryA(".\\tl", nullptr);
+        CreateDirectoryA(Config::tlAssetsPath, nullptr);
+
+        if (MH_CreateHookApi(L"kernel32", "CreateFileA",
+            (void*)&CreateFileA_Hook, (void**)&g_origCreateFileA) == MH_OK) {
+            MH_EnableHook(MH_ALL_HOOKS);
+            Log("[+] Asset redirection hooked (%s)\n", Config::tlAssetsPath);
+        }
+    }
+
     // Start file watcher
-    g_fileWatcher.Start(".", {"translation.tsv", "unique_names.tsv"}, []() {
+    std::string watchDir = ".\\tl"; // Default
+    std::string transFile = Config::translationFile;
+    size_t lastSlash = transFile.find_last_of("\\/");
+    if (lastSlash != std::string::npos) {
+        watchDir = transFile.substr(0, lastSlash);
+    }
+
+    g_fileWatcher.Start(watchDir.c_str(), { 
+        AssetRedirect::GetFileName(Config::translationFile), 
+        AssetRedirect::GetFileName(Config::namesFile) 
+    }, []() {
         g_stringPool.Clear();
         g_translationDB.Reload();
         MessageBeep(MB_OK);
