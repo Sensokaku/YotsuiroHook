@@ -243,8 +243,9 @@ def parse_defchara(data):
 # Text Extraction with Character ID Support
 #=============================================================================
 def extract_translatable(commands, filename):
-    """Extract translatable text with proper speaker names"""
+    """Extract translatable text with proper speaker names and flow tracking"""
     entries = []
+    current_branch = None
 
     for i, cmd in enumerate(commands):
         if cmd['type'] == 0x1C:  # MESSAGE
@@ -258,15 +259,14 @@ def extract_translatable(commands, filename):
                 'speaker': None,
                 'text': None,
                 'char_id': 0,
+                'branch': current_branch,  # Track which branch we're in
             }
 
-            # Get character ID from params (it's just params[0] directly)
             char_id = 0
             if cmd['params']:
                 char_id = cmd['params'][0]
             entry['char_id'] = char_id
 
-            # Parse strings
             inline_name = None
             if len(cmd['strings']) >= 2:
                 if cmd['strings'][0] and cmd['strings'][0] != '*':
@@ -275,53 +275,111 @@ def extract_translatable(commands, filename):
             elif len(cmd['strings']) == 1:
                 entry['text'] = cmd['strings'][0]
 
-            # Determine speaker:
-            # 1. Inline name (explicit in script)
-            # 2. CharID >= 3 lookup (from defChara.rld)
-            # 3. CharID 1-2: protagonist thoughts (no name shown)
-            # 4. CharID 0: narration (no speaker)
-
             if inline_name:
                 entry['speaker'] = inline_name
             elif char_id >= 3 and char_id in CHAR_TABLE:
                 entry['speaker'] = CHAR_TABLE[char_id]
-            # else: no speaker (narration or protagonist inner thoughts)
 
             if entry['text'] and is_translatable_text(entry['text']):
                 entries.append(entry)
 
-        elif cmd['type'] == 0x05:  # BLOCK - new scene
+        elif cmd['type'] == 0x05:  # BLOCK / LABEL
             if cmd['strings']:
                 raw_label = cmd['strings'][-1] if cmd['strings'] else ''
-                extracted = extract_label_text(raw_label)
 
-                if extracted and is_translatable_text(extracted):
+                # Parse BLOCK format: "id,flags,next,name,*"
+                parts = raw_label.split(',')
+                block_name = parts[3] if len(parts) >= 4 else ''
+                next_block = parts[2] if len(parts) >= 3 else ''
+
+                # Check for choice branch (R####＝N)
+                branch_match = re.match(r'^R(\d+)[＝=](\d+)$', block_name.strip())
+
+                if branch_match:
+                    question_id = branch_match.group(1)
+                    choice_num = branch_match.group(2)
+                    current_branch = f"CHOICE_{question_id}_{choice_num}"
+
                     entries.append({
                         'file': filename,
                         'index': i,
-                        'type': 'LABEL',
-                        'text': extracted,
+                        'type': 'BRANCH_START',
+                        'branch_id': current_branch,
                         'raw': raw_label,
                     })
 
-        elif cmd['type'] == 0x15:  # QUESTION/CHOICE
-            for j, opt in enumerate(cmd['strings']):
-                if opt and opt != '*' and is_translatable_text(opt):
+                elif block_name.strip() == '*' and current_branch:
+                    # Merge point - ends all branches
                     entries.append({
                         'file': filename,
                         'index': i,
-                        'type': f'CHOICE_{j}',
-                        'text': opt,})
+                        'type': 'MERGE',
+                        'raw': raw_label,
+                    })
+                    current_branch = None
 
-        elif cmd['type'] == 0x11:  # CHANGESCENARIO
+                else:
+                    # Regular label
+                    extracted = extract_label_text(raw_label)
+                    if extracted and is_translatable_text(extracted):
+                        if current_branch:
+                            current_branch = None
+
+                        entries.append({
+                            'file': filename,
+                            'index': i,
+                            'type': 'LABEL',
+                            'text': extracted,
+                            'raw': raw_label,
+                        })
+
+        elif cmd['type'] == 0x14:  # JUMP (within file)
             if cmd['strings']:
                 entries.append({
                     'file': filename,
                     'index': i,
                     'type': 'JUMP',
                     'target': cmd['strings'][0],
-                    '_no_tsv': True,
+                    'branch': current_branch,
                 })
+
+        elif cmd['type'] == 0x15:  # QUESTION/CHOICE
+            for j, opt_raw in enumerate(cmd['strings']):
+                if not opt_raw or opt_raw == '*':
+                    continue
+
+                parts = opt_raw.split('\t')
+                choice_texts = []
+
+                for part in parts:
+                    part = part.strip()
+                    if not part or part == '*':
+                        continue
+                    if part.lstrip('-').replace('.', '').isdigit():
+                        continue
+                    if part.endswith('.gyu') or part.startswith('res\\'):
+                        continue
+                    if contains_japanese(part) and is_translatable_text(part):
+                        choice_texts.append(part)
+
+                for choice_idx, choice_text in enumerate(choice_texts):
+                    entries.append({
+                        'file': filename,
+                        'index': i,
+                        'type': f'CHOICE_{j}_{choice_idx + 1}',
+                        'text': choice_text,
+                })
+
+        elif cmd['type'] == 0x11:  # CHANGESCENARIO (to another file)
+            if cmd['strings']:
+                entries.append({
+                    'file': filename,
+                    'index': i,
+                    'type': 'GOTO_FILE',
+                    'target': cmd['strings'][0],
+                    'branch': current_branch,
+                })
+            current_branch = None
 
     return entries
 
@@ -329,11 +387,13 @@ def extract_translatable(commands, filename):
 # Export Functions
 #=============================================================================
 def export_tsv(all_entries, output_path):
-    """Export translatable text to TSV"""
+    """Export translatable text to TSV with flow markers"""
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write("# Yotsuiro Passionato Translation File\n")
         f.write("# Save as UTF-8!\n")
         f.write("#\n")
+        f.write("# CHOICE_X_N = Choice option N\n")
+        f.write("# BRANCH markers show choice flow\n")
         f.write("# Leave NAME translation empty to use unique_names.tsv\n")
         f.write("#\n")
         f.write("FILE\tINDEX\tTYPE\tORIGINAL\tTRANSLATION\n")
@@ -342,21 +402,36 @@ def export_tsv(all_entries, output_path):
         count = 0
 
         for entry in all_entries:
-            if entry.get('_no_tsv'):
-                continue
-
+            # File header
             if entry['file'] != current_file:
                 current_file = entry['file']
                 f.write(f"#\n# === {current_file} ===\n#\n")
 
+            # Branch/flow markers (as comments)
+            if entry['type'] == 'BRANCH_START':
+                f.write(f"#\n#┌──── {entry['branch_id']} ────\n#│\n")
+                continue
+
+            if entry['type'] == 'JUMP':
+                branch_info = f" (in {entry['branch']})" if entry.get('branch') else ""
+                f.write(f"#│\n#└──→ JUMP: {entry['target']}{branch_info}\n#\n")
+                continue
+
+            if entry['type'] == 'GOTO_FILE':
+                branch_info = f" (in {entry['branch']})" if entry.get('branch') else ""
+                f.write(f"#│\n#└══→ GOTO: {entry['target']}{branch_info}\n#\n")
+                continue
+
+            if entry['type'] == 'MERGE':
+                f.write(f"#│\n#└──────── MERGE ────────\n#\n")
+                continue
+
+            # Actual translatable content
             if entry['type'] == 'MESSAGE':
-                # Output NAME if speaker exists
                 if entry.get('speaker'):
                     speaker_escaped = entry['speaker'].replace('\n', '\\n').replace('\t', '\\t')
                     f.write(f"{entry['file']}\t{entry['index']}\tNAME\t{speaker_escaped}\t\n")
                     count += 1
-
-                # ALWAYS output TEXT (not inside else!)
                 if entry.get('text'):
                     text_escaped = entry['text'].replace('\n', '\\n').replace('\t', '\\t')
                     f.write(f"{entry['file']}\t{entry['index']}\tTEXT\t{text_escaped}\t\n")
@@ -367,7 +442,7 @@ def export_tsv(all_entries, output_path):
                 f.write(f"{entry['file']}\t{entry['index']}\tLABEL\t{text_escaped}\t\n")
                 count += 1
 
-            elif entry['type'].startswith('CHOICE'):
+            elif entry['type'].startswith('CHOICE_'):
                 text_escaped = entry['text'].replace('\n', '\\n').replace('\t', '\\t')
                 f.write(f"{entry['file']}\t{entry['index']}\t{entry['type']}\t{text_escaped}\t\n")
                 count += 1
@@ -385,18 +460,26 @@ def export_json(all_entries, output_path):
         json.dump(clean_entries, f, ensure_ascii=False, indent=2)
 
 def export_txt(entries, output_path):
-    """Export human-readable script"""
+    """Export human-readable script with flow markers"""
     with open(output_path, 'w', encoding='utf-8') as f:
         for entry in entries:
-            if entry.get('_no_tsv'):
-                if entry['type'] == 'JUMP':
-                    f.write(f"\n[→ {entry.get('target', '?')}]\n\n")
-                continue
+            if entry['type'] == 'BRANCH_START':
+                f.write(f"\n{'─'*40}\n")
+                f.write(f"▼ {entry['branch_id']}\n")
+                f.write(f"{'─'*40}\n\n")
 
-            if entry['type'] == 'LABEL':
-                f.write(f"\n{'='*60}\n")
+            elif entry['type'] == 'JUMP':
+                branch_info = f" [{entry['branch']}]" if entry.get('branch') else ""
+                f.write(f"\n  └→ JUMP: {entry['target']}{branch_info}\n\n")
+
+            elif entry['type'] == 'GOTO_FILE':
+                branch_info = f" [{entry['branch']}]" if entry.get('branch') else ""
+                f.write(f"\n  └═→ GOTO: {entry['target']}{branch_info}\n\n")
+
+            elif entry['type'] == 'LABEL':
+                f.write(f"\n{'═'*60}\n")
                 f.write(f"【{entry['text']}】\n")
-                f.write(f"{'='*60}\n\n")
+                f.write(f"{'═'*60}\n\n")
 
             elif entry['type'] == 'MESSAGE':
                 speaker = entry.get('speaker')
@@ -405,9 +488,10 @@ def export_txt(entries, output_path):
                     f.write(f"【{speaker}】\n")
                 f.write(f"{text}\n\n")
 
-            elif entry['type'].startswith('CHOICE'):
-                idx = entry['type'].split('_')[1]
-                f.write(f"[{idx}] {entry['text']}\n")
+            elif entry['type'].startswith('CHOICE_'):
+                parts = entry['type'].split('_')
+                choice_num = parts[-1] if len(parts) >= 3 else '?'
+                f.write(f"▶ [{choice_num}] {entry['text']}\n")
 
 def export_unique_names(all_entries, output_path):
     """Export ALL unique speaker names (inline + defChara)"""
