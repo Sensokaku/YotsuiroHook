@@ -1,4 +1,4 @@
-#define WIN32_LEAN_AND_MEAN
+Ôªø#define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <objbase.h>
 #include <Psapi.h>
@@ -22,19 +22,38 @@
 // Function Offsets (ImageBase 0x10000000)
 //=============================================================================
 namespace Offsets {
-    constexpr uintptr_t AdvCharSay = 0x00039A10; // RetouchAdvCharacter::say()
-    constexpr uintptr_t PrintEx    = 0x00049A50; // RetouchPrintManager::printEx()
-    constexpr uintptr_t SaveDataTitle     = 0x0004D470; // RetouchSaveDataControl::title()
-    constexpr uintptr_t SaveDataIsValid   = 0x0004C210; // RetouchSaveDataControl::isValid()
-    constexpr uintptr_t SaveDataGetItem   = 0x0004C2E0; // RetouchSaveDataControl::getItem()
-    constexpr uintptr_t PrepareQuestion   = 0x000A5A20; // RetouchSystem::prepareQuestion()
+    constexpr uintptr_t AdvCharSay    = 0x00039A10; // RetouchAdvCharacter::say()
+    constexpr uintptr_t PrintEx       = 0x00049A50; // RetouchPrintManager::printEx()
+    constexpr uintptr_t SaveDataTitle = 0x0004D470; // RetouchSaveDataControl::title()
+    constexpr uintptr_t SaveDataIsValid  = 0x0004C210; // RetouchSaveDataControl::isValid()
+    constexpr uintptr_t SaveDataGetItem  = 0x0004C2E0; // RetouchSaveDataControl::getItem()
+    constexpr uintptr_t PrepareQuestion  = 0x000A5A20; // RetouchSystem::prepareQuestion()
+    constexpr uintptr_t LiteSetDebugMode = 0x000B20D0; // RetouchSystem::liteSetDebugMode()
+    constexpr uintptr_t LiteLoad         = 0x000C11D0; // RetouchSystem::liteLoad()
+}
+
+//=============================================================================
+// Constants
+//=============================================================================
+namespace Constants {
+    constexpr int kMaxLabelSuffixSearch = 30;
+    constexpr int kMaxSearchResults = 20;
+    constexpr DWORD kHotkeyPollIntervalMs = 50;
+    constexpr DWORD kFileWatcherDebounceMs = 100;
+    constexpr int kMaxMissedTextsToShow = 15;
 }
 
 //=============================================================================
 // Configuration
 //=============================================================================
 namespace Config {
-    // File paths
+    // Default file paths (relative to game executable)
+    constexpr const char* kDefaultTranslationFile = ".\\tl\\translation.tsv";
+    constexpr const char* kDefaultNamesFile = ".\\tl\\unique_names.tsv";
+    constexpr const char* kDefaultCharIdFile = ".\\tl\\char_table.tsv";
+    constexpr const char* kDefaultTlAssetsPath = ".\\tl\\assets\\";
+
+    // Runtime file paths (configurable via INI)
     char translationFile[MAX_PATH] = ".\\tl\\translation.tsv";
     char namesFile[MAX_PATH] = ".\\tl\\unique_names.tsv";
     char charIdFile[MAX_PATH] = ".\\tl\\char_table.tsv";
@@ -51,6 +70,8 @@ namespace Config {
 
     // Hotkeys
     int reloadHotkey = VK_F5;
+    int statsHotkey = VK_F6;
+    int logToggleHotkey = VK_F7;
 
     // Font
     char fontName[64] = "";
@@ -74,7 +95,7 @@ static void SaveDefaultConfig() {
     fprintf(f, "\n");
 
     fprintf(f, "[General]\n");
-    fprintf(f,"; Show debug console window\n");
+    fprintf(f, "; Show debug console window\n");
     fprintf(f, "EnableConsole=true\n");
     fprintf(f, "\n");
     fprintf(f, "; Log text to console\n");
@@ -90,8 +111,10 @@ static void SaveDefaultConfig() {
     fprintf(f, "\n");
 
     fprintf(f, "[Hotkeys]\n");
-    fprintf(f, "; Reload hotkey (VK code, F5=116, F6=117, etc.)\n");
+    fprintf(f, "; Hotkey VK codes: F5=116, F6=117, F7=118, F8=119\n");
     fprintf(f, "ReloadKey=116\n");
+    fprintf(f, "StatsKey=117\n");
+    fprintf(f, "LogToggleKey=118\n");
     fprintf(f, "\n");
 
     fprintf(f, "[Font]\n");
@@ -163,20 +186,22 @@ static void LoadConfig() {
 
     // Hotkeys
     Config::reloadHotkey = ReadInt("Hotkeys", "ReloadKey", VK_F5);
+    Config::statsHotkey = ReadInt("Hotkeys", "StatsKey", VK_F6);
+    Config::logToggleHotkey = ReadInt("Hotkeys", "LogToggleKey", VK_F7);
 
     // Font
     ReadString("Font", "Name", "", Config::fontName, sizeof(Config::fontName));
     ReadString("Font", "NameProportional", "", Config::fontNameProportional, sizeof(Config::fontNameProportional));
 
     // Files
-    ReadString("Files", "TranslationFile", ".\\tl\\translation.tsv", Config::translationFile, sizeof(Config::translationFile));
-    ReadString("Files", "NamesFile", ".\\tl\\unique_names.tsv", Config::namesFile, sizeof(Config::namesFile));
-    ReadString("Files", "CharIdFile", ".\\tl\\char_table.tsv", Config::charIdFile, sizeof(Config::charIdFile));
+    ReadString("Files", "TranslationFile", Config::kDefaultTranslationFile, Config::translationFile, sizeof(Config::translationFile));
+    ReadString("Files", "NamesFile", Config::kDefaultNamesFile, Config::namesFile, sizeof(Config::namesFile));
+    ReadString("Files", "CharIdFile", Config::kDefaultCharIdFile, Config::charIdFile, sizeof(Config::charIdFile));
 
     // Asset Redirection
     Config::enableAssetRedirect = ReadBool("Assets", "EnableRedirect", true);
     Config::logAssetRedirects = ReadBool("Assets", "LogRedirects", false);
-    ReadString("Assets", "Path", ".\\tl\\assets\\", Config::tlAssetsPath, sizeof(Config::tlAssetsPath));
+    ReadString("Assets", "Path", Config::kDefaultTlAssetsPath, Config::tlAssetsPath, sizeof(Config::tlAssetsPath));
 
     // Ensure path ends with backslash
     size_t len = strlen(Config::tlAssetsPath);
@@ -200,7 +225,7 @@ static std::mutex g_logMutex;
 static void InitConsole() {
     if (!Config::enableConsole) return;
     AllocConsole();
-    SetConsoleTitleW(L"ÇÊÇ¬Ç¢ÇÎÅöÉpÉbÉVÉáÉiÅ[ÉgÅI - Translation Hook");
+    SetConsoleTitleW(L"„Çà„Å§„ÅÑ„Çç‚òÖ„Éë„ÉÉ„Ç∑„Éß„Éä„Éº„ÉàÔºÅ - Translation Hook");
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
     freopen_s(&g_logFile, "CONOUT$", "w", stdout);
@@ -252,7 +277,8 @@ namespace Encoding {
                 unsigned char c2 = (unsigned char)data[i + 1];
                 if (c2 >= 0x80 && c2 <= 0xBF) {
                     utf8Score += 2;
-                    i++;continue;
+                    i++;
+                    continue;
                 }
             }
             if (c >= 0xE0 && c <= 0xEF && i + 2 < size) {
@@ -280,7 +306,7 @@ namespace Encoding {
 
         if (utf8Score > sjisScore * 2) return Type::UTF8;
         if (sjisScore > 0) return Type::ShiftJIS;
-        return Type::UTF8;// Default to UTF-8 for ASCII-only
+        return Type::UTF8;  // Default to UTF-8 for ASCII-only
     }
 
     // Shift-JIS -> UTF-8
@@ -342,10 +368,6 @@ namespace Encoding {
 // Asset Redirection
 //=============================================================================
 namespace AssetRedirect {
-    static bool FileExists(const char* path) {
-        DWORD attr = GetFileAttributesA(path);
-        return (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY));
-    }
 
     static std::string GetFileName(const std::string& path) {
         size_t pos = path.find_last_of("\\/");
@@ -369,7 +391,7 @@ namespace AssetRedirect {
 
         // Try 1: Exact path (tl/assets/g/ev/xxx.gyu)
         std::string tryPath = assetsPath + relativePath;
-        if (FileExists(tryPath.c_str())) {
+        if (::FileExists(tryPath.c_str())) {
             return tryPath;
         }
 
@@ -377,7 +399,7 @@ namespace AssetRedirect {
         size_t extPos = tryPath.rfind(".gyu");
         if (extPos != std::string::npos) {
             std::string pngPath = tryPath.substr(0, extPos) + ".png";
-            if (FileExists(pngPath.c_str())) {
+            if (::FileExists(pngPath.c_str())) {
                 return pngPath;
             }
         }
@@ -385,7 +407,7 @@ namespace AssetRedirect {
         // Try 3: Flat structure (tl/assets/xxx.gyu)
         std::string filename = GetFileName(originalPath);
         tryPath = assetsPath + filename;
-        if (FileExists(tryPath.c_str())) {
+        if (::FileExists(tryPath.c_str())) {
             return tryPath;
         }
 
@@ -394,7 +416,7 @@ namespace AssetRedirect {
         if (extPos != std::string::npos) {
             std::string pngName = filename.substr(0, extPos) + ".png";
             tryPath = assetsPath + pngName;
-            if (FileExists(tryPath.c_str())) {
+            if (::FileExists(tryPath.c_str())) {
                 return tryPath;
             }
         }
@@ -418,7 +440,7 @@ namespace TextFix {
                 (unsigned char)utf8[i] == 0xE2 &&
                 (unsigned char)utf8[i+1] == 0x80 &&
                 (unsigned char)utf8[i+2] == 0x94) {
-                // Replace with horizontal bar "Å\" (UTF-8: E2 80 95) - exists in SJIS
+                // Replace with horizontal bar "‚Äï" (UTF-8: E2 80 95) - exists in SJIS
                 result += "\xE2\x80\x95";
                 i += 3;
                 continue;
@@ -439,11 +461,12 @@ namespace TextFix {
                 (unsigned char)utf8[i] == 0xE2 &&
                 (unsigned char)utf8[i+1] == 0x80) {
                 unsigned char c3 = (unsigned char)utf8[i+2];
-                if (c3 == 0x98|| c3 == 0x99) {  // ' or '
+                if (c3 == 0x98 || c3 == 0x99) {  // ' or '
                     result += "'";
                     i += 3;
                     continue;
-                }if (c3 == 0x9C || c3 == 0x9D) {  // " or "
+                }
+                if (c3 == 0x9C || c3 == 0x9D) {  // " or "
                     result += "\"";
                     i += 3;
                     continue;
@@ -461,6 +484,13 @@ namespace TextFix {
 //=============================================================================
 // Translation Database
 //=============================================================================
+// Scene tracking globals
+namespace {
+    std::mutex g_sceneMutex;
+    std::string g_currentFile;
+    std::string g_currentLabel;
+}
+
 class TranslationDB {
 public:
     bool Load(const char* tsvPath, const char* namesPath) {
@@ -494,7 +524,9 @@ public:
         file.seekg(0);
 
         std::string content(fileSize, 0);
-        file.read(&content[0], fileSize);Encoding::Type encoding = Encoding::Detect(content.c_str(), content.size());
+        file.read(&content[0], fileSize);
+
+        Encoding::Type encoding = Encoding::Detect(content.c_str(), content.size());
         std::string utf8Content = Encoding::ToUtf8(content, encoding);
 
         // First pass: collect entries by index
@@ -516,7 +548,7 @@ public:
             }
             parts.push_back(line.substr(start));
 
-            if (parts.size() < 5|| parts[4].empty()) continue;
+            if (parts.size() < 5 || parts[4].empty()) continue;
 
             std::string fileId = parts[0];
             int index = std::atoi(parts[1].c_str());
@@ -535,9 +567,13 @@ public:
             } else if (type == "TEXT" || type == "MSG") {
                 textsByIndex[key] = original;
                 m_messages[original] = translated;
+                m_messageToFile[original] = fileId;
+                m_messageToIndex[original] = index;
                 textCount++;
             } else if (type == "LABEL") {
                 m_labels[original] = translated;
+                m_labelsByFileIndex[std::make_pair(fileId, index)] =
+                    translated.empty() ? original : translated;
                 labelCount++;
             } else if (type.rfind("CHOICE_", 0) == 0) {
                 m_messages[original] = translated;
@@ -546,7 +582,7 @@ public:
         }
 
         // Second pass: build contextual names (these OVERRIDE global)
-        for (auto& [key, translatedName] : namesByIndex) {
+        for (const auto& [key, translatedName] : namesByIndex) {
             std::string originalName = m_originalNamesByIndex[key];
 
             auto textIt = textsByIndex.find(key);
@@ -585,6 +621,32 @@ public:
         Load(Config::translationFile, Config::namesFile);
     }
 
+        void FindInDB(const std::string& searchText) {
+        std::lock_guard<std::mutex> lock(m_dataMutex);
+
+        int found = 0;
+        Log("\n[SEARCH] Looking for: %s\n", searchText.c_str());
+
+        for (const auto& [key, val] : m_messages) {
+            if (key.find(searchText) != std::string::npos ||
+                val.find(searchText) != std::string::npos) {
+                Log("  [%s] -> [%s]\n",
+                    key.substr(0, 40).c_str(),
+                    val.substr(0, 40).c_str());
+                found++;
+                if (found >= Constants::kMaxSearchResults) {
+                    Log("  ... (showing first %d)\n", Constants::kMaxSearchResults);
+                    break;
+                }
+            }
+        }
+
+        if (found == 0) {
+            Log("  No matches found.\n");
+        }
+        Log("\n");
+    }
+
     // Context-aware name lookup
     const std::string* FindNameTranslation(const char* sjisName, const char* sjisMessage) {
         if (!sjisName || !*sjisName) return nullptr;
@@ -615,7 +677,6 @@ public:
         return nullptr;
     }
 
-    // Message lookup (unchanged)
     const std::string* FindMessageTranslation(const char* sjisMessage) {
         if (!sjisMessage || !*sjisMessage) return nullptr;
 
@@ -626,7 +687,36 @@ public:
 
         auto it = m_messages.find(utf8Key);
         if (it != m_messages.end()) {
+            m_hitCount++;
+            {
+                std::lock_guard<std::mutex> slock(m_statsMutex);
+                m_usedKeys.insert(utf8Key);
+            }
+
+            // Track current scene from matched message
+            auto fileIt = m_messageToFile.find(utf8Key);
+            auto indexIt = m_messageToIndex.find(utf8Key);
+            if (fileIt != m_messageToFile.end() && indexIt != m_messageToIndex.end()) {
+                std::string label = GetNearestLabel(fileIt->second, indexIt->second);
+
+                std::lock_guard<std::mutex> sceneLock(g_sceneMutex);
+                if (g_currentFile != fileIt->second || g_currentLabel != label) {
+                    g_currentFile = fileIt->second;
+                    g_currentLabel = label;
+                    // Only log on scene change
+                    if (!label.empty()) {
+                        Log("[SCENE] %s | %s\n", g_currentFile.c_str(), g_currentLabel.c_str());
+                    }
+                }
+            }
+
             return &it->second;
+        }
+
+        m_missCount++;
+        {
+            std::lock_guard<std::mutex> slock(m_statsMutex);
+            m_missedTexts.insert(utf8Key);
         }
 
         LogMissing(utf8Key.c_str(), "TEXT");
@@ -634,7 +724,6 @@ public:
     }
 
     // Label
-    // Label lookup - with [X] suffix fallback
     const std::string* FindLabelTranslation(const char* sjisLabel) {
         if (!sjisLabel || !*sjisLabel) return nullptr;
 
@@ -651,7 +740,7 @@ public:
 
         // Save files don't include [X] suffix, but TSV does
         // Try appending " [1]", " [2]", etc.
-        for (int i = 1; i <= 30; i++) { // just 30 to be safe.
+        for (int i = 1; i <= Constants::kMaxLabelSuffixSearch; i++) {
             std::string withSuffix = utf8Key + " [" + std::to_string(i) + "]";
             it = m_labels.find(withSuffix);
             if (it != m_labels.end()) {
@@ -663,6 +752,54 @@ public:
         return nullptr;
     }
 
+    std::string GetNearestLabel(const std::string& file, int index) {
+        // Find highest label index <= message index
+        std::string bestLabel;
+        int bestIndex = -1;
+
+        for (const auto& [key, label] : m_labelsByFileIndex) {
+            if (key.first == file && key.second <= index && key.second > bestIndex) {
+                bestIndex = key.second;
+                bestLabel = label;
+            }
+        }
+
+        return bestLabel;
+    }
+
+    std::atomic<int> m_hitCount{0};
+    std::atomic<int> m_missCount{0};
+    std::unordered_set<std::string> m_usedKeys;  // Track which translations were used
+    std::mutex m_statsMutex;
+
+    void PrintStats() {
+        std::lock_guard<std::mutex> lock(m_dataMutex);
+        std::lock_guard<std::mutex> slock(m_statsMutex);
+
+        Log("\n========== Translation Stats ==========\n");
+        Log("  Loaded: %d messages, %d labels, %d names\n",
+            (int)m_messages.size(), (int)m_labels.size(), (int)m_names.size());
+        Log("  Hits: %d | Misses: %d\n", m_hitCount.load(), m_missCount.load());
+        Log("  Unique texts matched: %d\n", (int)m_usedKeys.size());
+
+        // Show missed texts (game sent but not in TSV)
+        if (!m_missedTexts.empty()) {
+            Log("\n--- Missed (game sent, not in TSV): ---\n");
+            int count = 0;
+            for (const auto& text : m_missedTexts) {
+                if (count++ < Constants::kMaxMissedTextsToShow) {
+                    Log("  %s\n", text.substr(0, 70).c_str());
+                }
+            }
+            if (m_missedTexts.size() > Constants::kMaxMissedTextsToShow) {
+                Log("  ... +%d more\n", (int)m_missedTexts.size() - Constants::kMaxMissedTextsToShow);
+            }
+        } else {
+            Log("\n  No missed texts! Everything translated.\n");
+        }
+
+        Log("=========================================\n\n");
+    }
 
 private:
     void UnescapeString(std::string& s) {
@@ -710,7 +847,9 @@ private:
         file.seekg(0);
 
         std::string content(fileSize, 0);
-        file.read(&content[0], fileSize);Encoding::Type encoding = Encoding::Detect(content.c_str(), content.size());
+        file.read(&content[0], fileSize);
+
+        Encoding::Type encoding = Encoding::Detect(content.c_str(), content.size());
         std::string utf8Content = Encoding::ToUtf8(content, encoding);
 
         int count = 0;
@@ -760,11 +899,16 @@ private:
     std::unordered_map<std::string, std::string> m_names;            // name -> translated (fallback)
     std::unordered_map<std::string, std::string> m_messages;         // message -> translated
     std::unordered_map<std::string, std::string> m_labels;           // label -> translated
+    std::unordered_map<std::string, std::string> m_messageToFile;    // message -> file
+    std::unordered_map<std::string, int> m_messageToIndex;           // message -> index
+    std::map<std::pair<std::string, int>, std::string> m_labelsByFileIndex;  // (file,index) -> label
     std::map<std::pair<std::string, int>, std::string> m_originalNamesByIndex;
     std::unordered_set<std::string> m_logged;
+    std::unordered_set<std::string> m_missedTexts;
     std::mutex m_dataMutex;
     std::mutex m_logMutex;
 };
+
 
 static TranslationDB g_translationDB;
 
@@ -849,7 +993,8 @@ namespace WordWrap {
                     lineLen = (int)(result.size() - lastSpace - 1);
                     lineStart = lastSpace + 1;
                     lastSpace = std::string::npos;
-                }// else: no good break point, let it overflow (game will handle)
+                }
+                // else: no good break point, let it overflow (game will handle)
             }
 
             i++;
@@ -866,34 +1011,39 @@ static std::atomic<bool> g_running{true};
 static HANDLE g_hotkeyThread = nullptr;
 
 static DWORD WINAPI HotkeyThreadProc(LPVOID) {
-    Log("[*] Hot reload enabled: Press F5 to reload translations\n");
-
     while (g_running) {
-        // Check hotkey (F5)
+        // Reload translations
         if (GetAsyncKeyState(Config::reloadHotkey) & 0x8000) {
-            // Wait for key release
-            while (GetAsyncKeyState(Config::reloadHotkey) & 0x8000) {
-                Sleep(10);
-            }
-
-            // Reload translations
+            while (GetAsyncKeyState(Config::reloadHotkey) & 0x8000) Sleep(10);
             g_stringPool.Clear();
             g_translationDB.Reload();
-
-            // Beep to confirm
             MessageBeep(MB_OK);
         }
 
-        Sleep(50);
-    }
+        // Print stats
+        if (GetAsyncKeyState(Config::statsHotkey) & 0x8000) {
+            while (GetAsyncKeyState(Config::statsHotkey) & 0x8000) Sleep(10);
+            g_translationDB.PrintStats();
+            MessageBeep(MB_OK);
+        }
 
+        // Toggle logging
+        if (GetAsyncKeyState(Config::logToggleHotkey) & 0x8000) {
+            while (GetAsyncKeyState(Config::logToggleHotkey) & 0x8000) Sleep(10);
+            Config::enableTextLogging = !Config::enableTextLogging;
+            Log("[*] Text logging: %s\n", Config::enableTextLogging ? "ON" : "OFF");
+            MessageBeep(MB_OK);
+        }
+
+        Sleep(Constants::kHotkeyPollIntervalMs);
+    }
     return 0;
 }
 
 //=============================================================================
-// Character ID Å® Original Name Lookup (from char_table.tsv)
+// Character ID ‚Üí Original Name Lookup (from char_table.tsv)
 //=============================================================================
-static std::unordered_map<int, std::string> g_charIdToName;  // ID Å® original JP name
+static std::unordered_map<int, std::string> g_charIdToName;  // ID ‚Üí original JP name
 
 static void LoadCharIdTable(const char* path) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
@@ -935,6 +1085,17 @@ static void LoadCharIdTable(const char* path) {
 }
 
 //=============================================================================
+// Debug Scene Jump
+//=============================================================================
+namespace DebugJump {
+    static std::mutex g_mutex;
+    static std::string g_pendingScene;
+    static int g_pendingBlockId = 0;
+    static bool g_jumpRequested = false;
+    static void* g_retouchSystem = nullptr;
+}
+
+//=============================================================================
 // Hook: RetouchAdvCharacter::say()
 //=============================================================================
 typedef void(__thiscall* Fn_AdvCharSay)(
@@ -956,12 +1117,12 @@ static void __fastcall AdvCharSay_Hook(
         int charId = *((int*)((uintptr_t)pThis + 4));
 
         if (charId > 0) {
-            // Step 1: CharID Å® original name
+            // Step 1: CharID ‚Üí original name
             auto it = g_charIdToName.find(charId);
             if (it != g_charIdToName.end()) {
                 const std::string& origName = it->second;
 
-                // Step 2: original name Å® translation (via unique_names.tsv)
+                // Step 2: original name ‚Üí translation (via unique_names.tsv)
                 std::string sjisName = Encoding::Utf8ToSjis(origName.c_str());
                 const std::string* tlUtf8 = g_translationDB.FindNameTranslation(sjisName.c_str(), nullptr);
 
@@ -969,7 +1130,9 @@ static void __fastcall AdvCharSay_Hook(
                     std::string sjis = Encoding::Utf8ToSjis(tlUtf8->c_str());
                     if (!sjis.empty()) {
                         finalName = g_stringPool.Store(sjis);
-                        Log("[SAY] CharID %d (%s) -> %s\n", charId, origName.c_str(), tlUtf8->c_str());
+                        if (Config::enableTextLogging) {
+                            Log("[SAY] CharID %d (%s) -> %s\n", charId, origName.c_str(), tlUtf8->c_str());
+                        }
                     }
                 } else {
                     // No translation, use original name
@@ -996,7 +1159,7 @@ static void __fastcall AdvCharSay_Hook(
             std::string normalized = TextFix::NormalizeUtf8(*tlUtf8);
             std::string sjis = Encoding::Utf8ToSjis(normalized.c_str());
             if (!sjis.empty()) {
-                std::string wrapped = WordWrap::Wrap(sjis, Config::wordWrapWidth); // Apply word wrapping
+                std::string wrapped = WordWrap::Wrap(sjis, Config::wordWrapWidth);
                 finalMsg = g_stringPool.Store(wrapped);
             }
         }
@@ -1098,7 +1261,14 @@ static int __fastcall SaveDataTitle_Hook(
     std::string translatedSjis;
 
     if (labelSjis && *labelSjis) {
+        // Track current label for scene info
+        {
+            std::lock_guard<std::mutex> lock(g_sceneMutex);
+            g_currentLabel = Encoding::SjisToUtf8(labelSjis);
+        }
+
         const std::string* translated = g_translationDB.FindLabelTranslation(labelSjis);
+
         if (translated) {
             translatedSjis = Encoding::Utf8ToSjis(translated->c_str());
             finalLabel = translatedSjis.c_str();
@@ -1152,6 +1322,93 @@ static void __fastcall PrepareQuestion_Hook(void* pThis, void* edx, int choiceId
 }
 
 //=============================================================================
+// Hook: RetouchSystem::liteLoad() - Scene Tracking
+//=============================================================================
+typedef void(__thiscall* Fn_LiteSetDebugMode)(void* pThis, unsigned int flags);
+static Fn_LiteSetDebugMode g_liteSetDebugMode = nullptr;
+
+typedef char(__thiscall* Fn_LiteLoad)(void* pThis, const char* path, unsigned int flags);
+static Fn_LiteLoad g_origLiteLoad = nullptr;
+
+static char __fastcall LiteLoad_Hook(void* pThis, void* edx, const char* path, unsigned int flags)
+{
+    // Capture RetouchSystem pointer
+    {
+        std::lock_guard<std::mutex> lock(DebugJump::g_mutex);
+        DebugJump::g_retouchSystem = pThis;
+    }
+
+    const char* finalPath = path;
+    std::string overridePath;
+
+    // Check for pending debug jump
+    {
+        std::lock_guard<std::mutex> lock(DebugJump::g_mutex);
+        if (DebugJump::g_jumpRequested && !DebugJump::g_pendingScene.empty()) {
+            // Replace with jump target (keep same format: "scenename.rld")
+            overridePath = "rld\\" + DebugJump::g_pendingScene + ".rld";
+            finalPath = overridePath.c_str();
+
+            Log("\n[DEBUG] =======================================\n");
+            Log("[DEBUG] SCENE JUMP ACTIVATED!\n");
+            Log("[DEBUG]   Original: %s\n", path);
+            Log("[DEBUG]   Jump to:  %s\n", finalPath);
+            Log("[DEBUG] =======================================\n\n");
+
+            DebugJump::g_jumpRequested = false;
+            DebugJump::g_pendingScene.clear();
+        }
+    }
+
+    // Track with potentially overridden path
+    if (finalPath && *finalPath) {
+        std::string pathStr(finalPath);
+        std::string filename = pathStr;
+
+        size_t lastSlash = filename.find_last_of("\\/");
+        if (lastSlash != std::string::npos) {
+            filename = filename.substr(lastSlash + 1);
+        }
+
+        size_t lastDot = filename.find_last_of(".");
+        if (lastDot != std::string::npos) {
+            filename = filename.substr(0, lastDot);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_sceneMutex);
+            g_currentFile = filename;
+            g_currentLabel.clear();
+        }
+
+        Log("[LOAD] %s\n", filename.c_str());
+    }
+
+    return g_origLiteLoad(pThis, finalPath, flags);
+}
+
+//=============================================================================
+// OutputDebugStringA - Redirect to Console
+//=============================================================================
+typedef void(WINAPI* Fn_OutputDebugStringA)(LPCSTR lpOutputString);
+static Fn_OutputDebugStringA g_origOutputDebugStringA = nullptr;
+
+static void WINAPI OutputDebugStringA_Hook(LPCSTR lpOutputString) {
+    // Also send to our console
+    if (lpOutputString && *lpOutputString) {
+        Log("[GAME] %s", lpOutputString);
+        // Add newline if not present
+        size_t len = strlen(lpOutputString);
+        if (len > 0 && lpOutputString[len-1] != '\n') {
+            Log("\n");
+        }
+    }
+
+    // Still call original (for DebugView if someone uses it)
+    g_origOutputDebugStringA(lpOutputString);
+}
+
+//=============================================================================
 // GetGlyphOutlineA Font Fix
 //=============================================================================
 typedef DWORD(WINAPI* Fn_GetGlyphOutlineA)(
@@ -1194,7 +1451,7 @@ static HFONT WINAPI CreateFontIndirectA_Hook(const LOGFONTA* lf) {
         std::string origName = Encoding::SjisToUtf8(lf->lfFaceName);
         const char* newFont = nullptr;
 
-        // Check for proportional (Ço in SJIS =0x820x6F)
+        // Check for proportional (Ôº∞ in SJIS =0x820x6F)
         bool isProportional = (strstr(lf->lfFaceName, "\x82\x6F") != nullptr);
 
         if (isProportional) {
@@ -1365,7 +1622,7 @@ private:
                     } while (true);
 
                     if (shouldReload) {
-                        Sleep(100);  // Debounce
+                        Sleep(Constants::kFileWatcherDebounceMs);  // Debounce
                         FILETIME newTime = GetLatestModTime();
                         if (CompareFileTime(&newTime, &m_lastWriteTime) != 0) {
                             m_lastWriteTime = newTime;
@@ -1409,6 +1666,151 @@ private:
 };
 
 static FileWatcher g_fileWatcher;
+
+//=============================================================================
+// Debug Console Commands
+//=============================================================================
+static void ProcessDebugCommand(const std::string& cmd) {
+    std::istringstream iss(cmd);
+    std::string verb;
+    iss >> verb;
+
+    if (verb == "help") {
+        Log("\n=== Debug Commands ===\n");
+        Log("  debug on/off - Toggle game debug mode\n");
+        Log("  stats        - Show translation stats\n");
+        Log("  reload       - Reload translations\n");
+        Log("  scene        - Show current scene\n");
+        Log("  find <text>  - Search for text in DB\n");
+        Log("  log on/off   - Toggle logging\n");
+        Log("  goto <file> [block] - Jump to scene\n");
+        Log("  list         - List common scenes\n");
+        Log("========================\n\n");
+    } else if (verb == "debug") {
+        std::string state;iss >> state;
+
+        std::lock_guard<std::mutex> lock(DebugJump::g_mutex);
+
+        if (!DebugJump::g_retouchSystem) {
+            Log("[DEBUG] RetouchSystem not captured yet. Start game first!\n");
+            return;
+        }
+
+        if (!g_liteSetDebugMode) {
+            Log("[DEBUG] liteSetDebugMode not available\n");
+            return;
+        }
+
+        if (state == "on") {
+            g_liteSetDebugMode(DebugJump::g_retouchSystem, 0x10001);
+            Log("[DEBUG] Debug mode ENABLED (0x10001)\n");
+        } else if (state == "off") {
+            g_liteSetDebugMode(DebugJump::g_retouchSystem, 0);
+            Log("[DEBUG] Debug mode DISABLED\n");
+        } else {
+            // Show current state
+            DWORD* pSystem = (DWORD*)DebugJump::g_retouchSystem;
+            DWORD currentFlags = pSystem[0x112C / 4];  // offset 0x112C = index 1099
+            Log("[DEBUG] Current debug flags: 0x%08X\n", currentFlags);
+            Log("[DEBUG] Usage: debug on | debug off\n");
+        }
+    } else if (verb == "stats") {
+        g_translationDB.PrintStats();
+    }
+    else if (verb == "reload") {
+        g_stringPool.Clear();
+        g_translationDB.Reload();
+        Log("[*] Reloaded!\n");
+    }
+    else if (verb == "scene") {
+        std::lock_guard<std::mutex> lock(g_sceneMutex);
+        Log("[SCENE] File: %s\n", g_currentFile.c_str());
+        Log("[SCENE] Label: %s\n", g_currentLabel.c_str());
+
+        std::lock_guard<std::mutex> lock2(DebugJump::g_mutex);
+        Log("[SCENE] RetouchSystem: %p\n", DebugJump::g_retouchSystem);
+    }
+    else if (verb == "find") {
+        std::string searchText;
+        std::getline(iss >> std::ws, searchText);
+        if (!searchText.empty()) {
+            g_translationDB.FindInDB(searchText);
+        }
+    }
+    else if (verb == "log") {
+        std::string state;
+        iss >> state;
+        Config::enableTextLogging = (state == "on");
+        Log("[*] Logging: %s\n", Config::enableTextLogging ? "ON" : "OFF");
+    }
+    else if (verb == "goto") {
+        std::string sceneName;
+        int blockId = 0;
+        iss >> sceneName >> blockId;
+
+        if (sceneName.empty()) {
+            Log("\n[DEBUG] Usage: goto <sceneName> [blockId]\n");
+            Log("[DEBUG] Examples:\n");
+            Log("[DEBUG]   goto y0011001       - Start of prologue\n");
+            Log("[DEBUG]   goto y1034001       - Chapter 1, Day 3-4\n");
+            Log("[DEBUG]   goto y1034001 1010  - Chapter 1, Day 3-4, Block 1010\n");
+            Log("[DEBUG]\n");
+            Log("[DEBUG] Jump happens on next scene transition.\n");
+            Log("[DEBUG] Advance the game or return to title to trigger.\n\n");
+        } else {
+            std::lock_guard<std::mutex> lock(DebugJump::g_mutex);
+            DebugJump::g_pendingScene = sceneName;
+            DebugJump::g_pendingBlockId = blockId;
+            DebugJump::g_jumpRequested = true;
+
+            Log("\n[DEBUG] =======================================\n");
+            Log("[DEBUG] Jump queued: %s", sceneName.c_str());
+            if (blockId > 0) Log(" (block %d)", blockId);
+            Log("\n");
+            Log("[DEBUG] Advance game or use title menu to trigger.\n");
+            Log("[DEBUG] =======================================\n\n");
+        }
+    }
+    else if (verb == "list") {
+        Log("\n=== Scene List ===\n");
+        Log("  Prologue:\n");
+        Log("    y0011001 - y0017001\n");
+        Log("    y0021001 - y0024001\n");
+        Log("  Chapter 1 (Day 1-4):\n");
+        Log("    y1011001 - y1015001 (Day 1)\n");
+        Log("    y1021001 - y1025001 (Day 2)\n");
+        Log("    y1031001 - y1036001 (Day 3)\n");
+        Log("    y1041001 - y1043001 (Day 4)\n");
+        Log("  Chapters 2-9: y2XXXXXX - y9XXXXXX\n");
+        Log("  Chapter 10: yAXXXXXX\n");
+        Log("  Endings: yEA11001, yEB11001, yEC11001, yED11001\n");
+        Log("  H-Scenes: yHR0_001 - yHR0_016\n");
+        Log("  Extras: yotuiro_omake\n");
+        Log("==================\n\n");
+    }
+    else if (!verb.empty()) {
+        Log("[?] Unknown command: %s (type 'help')\n", verb.c_str());
+    }
+}
+
+static DWORD WINAPI ConsoleInputThread(LPVOID) {
+    Log("[*] Debug console ready. Type 'help' for commands.\n\n");
+
+    char buffer[256];
+    while (g_running) {
+        if (fgets(buffer, sizeof(buffer), stdin)) {
+            std::string cmd(buffer);
+            // Trim newline
+            while (!cmd.empty() && (cmd.back() == '\n' || cmd.back() == '\r')) {
+                cmd.pop_back();
+            }
+            if (!cmd.empty()) {
+                ProcessDebugCommand(cmd);
+            }
+        }
+    }
+    return 0;
+}
 
 //=============================================================================
 // Hook Installation
@@ -1462,9 +1864,24 @@ static bool InstallHooks(HMODULE hResident) {
         }
     }
 
+    // Hook RetouchSystem::liteLoad() for scene tracking
+    {
+        uintptr_t addr = base + Offsets::LiteLoad;
+        Log("[*] Trying to hook RetouchSystem::liteLoad() at 0x%p\n", (void*)addr);
+        if (MH_CreateHook((void*)addr, (void*)&LiteLoad_Hook, (void**)&g_origLiteLoad) == MH_OK) {
+            MH_EnableHook((void*)addr);
+            Log("[+] RetouchSystem::liteLoad() hooked - scene tracking active\n");
+        }
+    }
+
+    // Get liteSetDebugMode function pointer (no hook needed, just call it)
+    g_liteSetDebugMode = (Fn_LiteSetDebugMode)(base + Offsets::LiteSetDebugMode);
+    Log("[+] liteSetDebugMode at 0x%p\n", (void*)g_liteSetDebugMode);
+
     Log("\n========================================\n");
     Log("Translation Hook Active!\n");
-    Log("Press F5 to reload translations\n");
+    Log("[*] Hotkeys: 0x%02X=Reload, 0x%02X=Stats, 0x%02X=Toggle Logging\n",
+        Config::reloadHotkey, Config::statsHotkey, Config::logToggleHotkey);
     Log("========================================\n\n");
 
     return true;
@@ -1497,10 +1914,17 @@ static bool Initialize() {
 
     if (Config::enableConsole) {
         InitConsole();
+
+        // Enable console input
+        FILE* stdinFile;
+        freopen_s(&stdinFile, "CONIN$", "r", stdin);
+
+        // Start input thread
+        CreateThread(nullptr, 0, ConsoleInputThread, nullptr, 0, nullptr);
     }
 
     Log("==================================================\n");
-    Log("%s\n", Encoding::SjisToUtf8("ÇÊÇ¬Ç¢ÇÎÅöÉpÉbÉVÉáÉiÅ[ÉgÅI - Translation Hook").c_str());
+    Log("%s\n", Encoding::SjisToUtf8("„Çà„Å§„ÅÑ„Çç‚òÖ„Éë„ÉÉ„Ç∑„Éß„Éä„Éº„ÉàÔºÅ - Translation Hook").c_str());
     Log("==================================================\n\n");
 
     // Load translations using config paths
@@ -1510,6 +1934,12 @@ static bool Initialize() {
     if (MH_Initialize() != MH_OK) {
         Log("[!] MinHook init failed\n");
         return false;
+    }
+
+    // Hook OutputDebugStringA to capture game debug output
+    if (MH_CreateHookApi(L"kernel32", "OutputDebugStringA",
+        (void*)&OutputDebugStringA_Hook, (void**)&g_origOutputDebugStringA) == MH_OK) {
+        MH_EnableHook(MH_ALL_HOOKS);Log("[+] OutputDebugStringA hooked - game debug ‚Üí console\n");
     }
 
     // Hook GetGlyphOutlineA
