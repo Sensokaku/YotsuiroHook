@@ -229,7 +229,7 @@ static void LoadConfig() {
 
 static std::atomic<bool> g_discordRunning{false};
 static bool g_presenceTimerSet = false;
-static std::string g_currentChapter = "In menus";
+static std::string g_currentChapter = "Loading...";
 static std::chrono::steady_clock::time_point g_presenceStartTime;
 static void Log(const char* fmt, ...);
 
@@ -289,7 +289,7 @@ static void InitDiscordRPC() {
     std::thread(DiscordUpdateThread).detach();
 
     // Initial presence
-    g_currentChapter = "In Menus";
+    g_currentChapter = "Loading...";
     UpdateDiscordPresence();
 }
 
@@ -1480,6 +1480,18 @@ static char __fastcall LiteLoad_Hook(void* pThis, void* edx, const char* path, u
             std::lock_guard<std::mutex> lock(g_sceneMutex);
             g_currentFile = filename;
             g_currentLabel.clear();
+
+            std::string display;
+            if (filename == "title")
+            {
+                display = "Main Menu";
+            }
+            else if (g_currentLabel.empty())
+            {
+                display = "Loading...";
+            }
+
+            UpdateChapterPresence(display);
         }
 
         Log("[LOAD] %s\n", filename.c_str());
