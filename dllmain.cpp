@@ -1480,6 +1480,18 @@ static char __fastcall LiteLoad_Hook(void* pThis, void* edx, const char* path, u
             std::lock_guard<std::mutex> lock(g_sceneMutex);
             g_currentFile = filename;
             g_currentLabel.clear();
+
+            std::string display;
+            if (filename == "title")
+            {
+                display = "Main Menu";
+            }
+            else if (g_currentLabel.empty())
+            {
+                display = "Loading...";
+            }
+
+            UpdateChapterPresence(display);
         }
 
         Log("[LOAD] %s\n", filename.c_str());
