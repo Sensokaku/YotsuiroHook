@@ -229,7 +229,7 @@ static void LoadConfig() {
 
 static std::atomic<bool> g_discordRunning{false};
 static bool g_presenceTimerSet = false;
-static std::string g_currentChapter = "In menus";
+static std::string g_currentChapter = "Loading...";
 static std::chrono::steady_clock::time_point g_presenceStartTime;
 static void Log(const char* fmt, ...);
 
@@ -289,7 +289,7 @@ static void InitDiscordRPC() {
     std::thread(DiscordUpdateThread).detach();
 
     // Initial presence
-    g_currentChapter = "In Menus";
+    g_currentChapter = "Loading...";
     UpdateDiscordPresence();
 }
 
