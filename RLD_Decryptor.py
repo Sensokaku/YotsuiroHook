@@ -569,6 +569,136 @@ def process_file(filepath, keys, output_dirs, is_defchara=False):
     return entries, f"{len(commands)} cmds, {msg_count} msgs"
 
 #=============================================================================
+# Fix Corrupted TSV
+#=============================================================================
+def fix_corrupted_tsv(rld_dir, working_tsv, output_tsv=None):
+    """Fix corrupted ORIGINAL column using RLD as source of truth"""
+    if output_tsv is None:
+        output_tsv = working_tsv  # Overwrite in place
+
+    rld_dir = Path(rld_dir)
+
+    # Step 1: Generate keys
+    print("[*] Generating key tables...")
+    keys = generate_key_table(KNOWN_SEEDS['_default'])
+
+    # Step 2: Load defChara first
+    defchara_file = rld_dir / 'defChara.rld'
+    if defchara_file.exists():
+        with open(defchara_file, 'rb') as f:
+            data = f.read()
+        decrypted = decrypt_rld(data, keys)
+        parse_defchara(decrypted)
+        print(f"    Loaded {len(CHAR_TABLE)} character IDs")
+
+    # Step 3: Build pristine originals from RLD
+    print("[*] Loading pristine originals from RLD files...")
+    pristine = {}  # (file, index, type) -> original
+
+    for rld_file in sorted(rld_dir.glob('*.rld')):
+        filename = rld_file.stem
+
+        if filename.lower() == 'defchara':
+            continue
+
+        with open(rld_file, 'rb') as f:
+            data = f.read()
+
+        if len(data) < 16 or data[1:4] != b'DLR':
+            continue
+
+        decrypted = decrypt_rld(data, keys)
+        commands = parse_rld(decrypted)
+        entries = extract_translatable(commands, filename)
+
+        for entry in entries:
+            if entry['type'] in ('BRANCH_START', 'MERGE', 'JUMP', 'GOTO_FILE'):
+                continue
+
+            idx = entry['index']
+
+            if entry['type'] == 'MESSAGE':
+                if entry.get('speaker'):
+                    pristine[(filename, idx, 'NAME')] = entry['speaker']
+                if entry.get('text'):
+                    pristine[(filename, idx, 'TEXT')] = entry['text']
+            elif entry['type'] == 'LABEL':
+                pristine[(filename, idx, 'LABEL')] = entry['text']
+            elif entry['type'].startswith('CHOICE_'):
+                pristine[(filename, idx, entry['type'])] = entry['text']
+
+    print(f"    {len(pristine)} entries from RLD")
+
+    # Step 4: Load and fix working TSV
+    print(f"[*] Loading working TSV: {working_tsv}")
+    lines = []
+    fixed_count = 0
+    not_found_count = 0
+
+    with open(working_tsv, 'r', encoding='utf-8') as f:
+        for line in f:
+            # Preserve comments and empty lines
+            if line.startswith('#') or '\t' not in line or line.strip() == '':
+                lines.append(line)
+                continue
+
+            parts = line.rstrip('\r\n').split('\t')
+            if len(parts) < 4:
+                lines.append(line)
+                continue
+
+            file_id = parts[0]
+            try:
+                index = int(parts[1])
+            except ValueError:
+                lines.append(line)
+                continue
+
+            entry_type = parts[2]
+            tsv_original = parts[3].replace('\\n', '\n').replace('\\t', '\t')
+            translation = parts[4] if len(parts) >= 5 else ''
+
+            # Lookup pristine
+            key = (file_id, index, entry_type)
+            if key in pristine:
+                pristine_original = pristine[key]
+                if tsv_original != pristine_original:
+                    # CORRUPTED - fix it
+                    fixed_original = pristine_original.replace('\n', '\\n').replace('\t', '\\t')
+                    parts[3] = fixed_original
+
+                    # Ensure we have 5 columns
+                    while len(parts) < 5:
+                        parts.append('')
+
+                    line = '\t'.join(parts) + '\n'
+                    fixed_count += 1
+
+                    print(f"    FIXED {file_id}#{index} [{entry_type}]")
+                    print(f"      Was: \"{tsv_original[:60]}\"")
+                    print(f"      Now: \"{pristine_original[:60]}\"")
+            else:
+                not_found_count += 1
+
+            lines.append(line)
+
+    # Step 5: Write fixed TSV
+    print(f"[*] Writing fixed TSV: {output_tsv}")
+    with open(output_tsv, 'w', encoding='utf-8', newline='') as f:
+        f.writelines(lines)
+
+    print(f"\n{'='*60}")
+    print(f"DONE!")
+    print(f"  Fixed: {fixed_count} corrupted entries")
+    if fixed_count > 10:
+        print(f"         (showed first 10)")
+    if not_found_count > 0:
+        print(f"  Warning: {not_found_count} TSV entries not found in RLD")
+    print(f"{'='*60}")
+
+    return fixed_count
+
+#=============================================================================
 # Main
 #=============================================================================
 def main():
@@ -579,11 +709,17 @@ def main():
 ╠══════════════════════════════════════════════════════════════╣
 ║  • Decrypts RLD files                                        ║
 ║  • Parses defChara.rld for character names                   ║
-║  • Resolves character IDs → actual names                     ║
+║  • Resolves character IDs -> actual names                    ║
 ║  • Exports translation-ready TSV/JSON                        ║
+║  • Fixes corrupted TSV originals                             ║
 ╚══════════════════════════════════════════════════════════════╝
 
-Usage: python rld_tool.py <rld_folder> [output_folder]
+Usage:
+  python rld_tool.py <rld_folder> [output_folder]
+      Extract translations from RLD files
+
+  python rld_tool.py --fix <rld_folder> <tsv_file> [output_tsv]
+      Fix corrupted ORIGINAL column in TSV using RLD as source
 
 Output:
   output/
@@ -596,6 +732,23 @@ Output:
 """)
         return
 
+    # --fix mode
+    if sys.argv[1] == '--fix':
+        if len(sys.argv) < 4:
+            print("Usage: python rld_tool.py --fix <rld_folder> <tsv_file> [output_tsv]")
+            print("")
+            print("  rld_folder  = folder containing .rld files")
+            print("  tsv_file    = corrupted translation.tsv to fix")
+            print("  output_tsv  = (optional) output file, defaults to overwriting tsv_file")
+            return
+
+        rld_dir = sys.argv[2]
+        tsv_file = sys.argv[3]
+        output_tsv = sys.argv[4] if len(sys.argv) > 4 else None
+        fix_corrupted_tsv(rld_dir, tsv_file, output_tsv)
+        return
+
+    # Normal extraction mode
     input_dir = Path(sys.argv[1])
     output_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else Path('output')
 
@@ -683,8 +836,8 @@ COMPLETE!
 Translation workflow:
   1. Edit unique_names.tsv (global name translations)
   2. Edit translation.tsv (dialogue)
-  3. Copy both to game folder
-  4. Run game with hook
+  3. Run: python rld_tool.py --fix rld tl\\translation.tsv
+  4. Copy to game folder and run
 {'='*60}
 """)
 
