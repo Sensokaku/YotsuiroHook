@@ -18,6 +18,10 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(minhook)
 
+# Force static runtime HARD on discord-rpc (override any internal /MD)
+set_property(TARGET discord-rpc PROPERTY
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 # Discord-RPC
 FetchContent_Declare(
     discord-rpc
@@ -25,10 +29,6 @@ FetchContent_Declare(
     GIT_TAG main
 )
 FetchContent_MakeAvailable(discord-rpc)
-
-# Force static runtime HARD on discord-rpc (override any internal /MD)
-set_property(TARGET discord-rpc PROPERTY
-    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # Also force-remove any /MD flags that might sneak in
 if(MSVC)
@@ -60,3 +60,4 @@ target_include_directories(dinput8 PRIVATE
 # Also force static runtime on minhook
 set_property(TARGET minhook PROPERTY
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
