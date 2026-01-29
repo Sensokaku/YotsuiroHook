@@ -14,7 +14,9 @@
 #include <vector>
 #include <functional>
 #include <atomic>
+#include <chrono>
 #include <MinHook.h>
+#include <discord_rpc.h>
 
 #pragma comment(lib, "psapi.lib")
 
@@ -64,6 +66,7 @@ namespace Config {
     bool enableConsole = true;
     bool enableTextLogging = true;
     bool dumpUntranslated = false;
+    bool enableDiscordPresence = true;
 
     // Text
     int wordWrapWidth = 70;
@@ -103,6 +106,9 @@ static void SaveDefaultConfig() {
     fprintf(f, "\n");
     fprintf(f, "; Dump untranslated text to file\n");
     fprintf(f, "DumpUntranslated=false\n");
+    fprintf(f, "\n");
+    fprintf(f, "; Enable Discord Rich Presence (shows current chapter/label in Discord status)\n");
+    fprintf(f, "EnableDiscordPresence=true\n");
     fprintf(f, "\n");
 
     fprintf(f, "[Text]\n");
@@ -180,6 +186,7 @@ static void LoadConfig() {
     Config::enableConsole = ReadBool("General", "EnableConsole", true);
     Config::enableTextLogging = ReadBool("General", "EnableTextLogging", true);
     Config::dumpUntranslated = ReadBool("General", "DumpUntranslated", false);
+    Config::enableDiscordPresence = ReadBool("General", "EnableDiscordPresence", true);
 
     // Text
     Config::wordWrapWidth = ReadInt("Text", "WordWrapWidth", 70);
@@ -214,6 +221,95 @@ static void LoadConfig() {
     if (Config::fontName[0] != '\0') {
         Log("[CONFIG] Font: %s\n", Config::fontName);
     }
+}
+
+//=============================================================================
+// Discord RPC
+//=============================================================================
+
+static std::atomic<bool> g_discordRunning{false};
+static bool g_presenceTimerSet = false;
+static std::string g_currentChapter = "In menus";
+static std::chrono::steady_clock::time_point g_presenceStartTime;
+static void Log(const char* fmt, ...);
+
+static const char* DISCORD_CLIENT_ID = "1466328361583251488";
+
+static void OnDiscordReady(const DiscordUser* connectedUser) {
+    Log("[Discord] Connected as %s#%s\n", connectedUser->username, connectedUser->discriminator);
+}
+
+static void OnDiscordDisconnected(int errcode, const char* message) {
+    Log("[Discord] Disconnected (%d): %s\n", errcode, message);
+    g_discordRunning = false;
+}
+
+static void OnDiscordError(int errcode, const char* message) {
+    Log("[Discord] Error (%d): %s\n", errcode, message);
+}
+
+static void UpdateDiscordPresence() {
+    if (!Config::enableDiscordPresence || !g_discordRunning) return;
+
+    DiscordRichPresence rp = {};
+    rp.state          = "";
+    rp.details        = g_currentChapter.c_str();
+    rp.largeImageKey  = "icon";
+    rp.largeImageText = "";
+    // Optional: rp.smallImageKey = "playing"; etc.
+    // Only set startTimestamp once (when first showing presence)
+    if (!g_presenceTimerSet) {
+        auto now = std::chrono::system_clock::now();
+        rp.startTimestamp = std::chrono::duration_cast<std::chrono::seconds>(
+            now.time_since_epoch()).count();
+        g_presenceTimerSet = true;
+    }
+
+    Discord_UpdatePresence(&rp);
+}
+
+static void DiscordUpdateThread() {
+    while (g_discordRunning) {
+        Discord_RunCallbacks();
+        UpdateDiscordPresence();
+        std::this_thread::sleep_for(std::chrono::seconds(10));
+    }
+}
+
+static void InitDiscordRPC() {
+    DiscordEventHandlers handlers = {};
+    handlers.ready      = OnDiscordReady;
+    handlers.disconnected = OnDiscordDisconnected;
+    handlers.errored    = OnDiscordError;
+
+    Discord_Initialize(DISCORD_CLIENT_ID, &handlers, 1, nullptr);
+    g_presenceStartTime = std::chrono::steady_clock::now();
+    g_discordRunning = true;
+
+    std::thread(DiscordUpdateThread).detach();
+
+    // Initial presence
+    g_currentChapter = "In Menus";
+    UpdateDiscordPresence();
+}
+
+static void ShutdownDiscordRPC() {
+    if (!g_discordRunning) return;
+    g_discordRunning = false;
+    g_presenceTimerSet = false;
+    Discord_ClearPresence();
+    Discord_Shutdown();
+}
+
+// Call this whenever chapter/label changes
+void UpdateChapterPresence(const std::string& chapterName) {
+    if (!Config::enableDiscordPresence) return;
+
+    if (chapterName.empty() || chapterName == g_currentChapter) return;
+
+    g_currentChapter = chapterName;
+    Log("[Discord] Updated chapter: %s\n", chapterName.c_str());
+    UpdateDiscordPresence();
 }
 
 //=============================================================================
@@ -709,6 +805,11 @@ public:
                     }
                 }
             }
+
+            std::string display = g_currentLabel.c_str();
+            size_t bracket = display.rfind(" [");
+            if (bracket != std::string::npos) display.erase(bracket);
+            UpdateChapterPresence(display);
 
             return &it->second;
         }
@@ -1912,6 +2013,14 @@ static bool Initialize() {
     // Load config FIRST (before console init, so we know if console is enabled)
     LoadConfig();
 
+    // Load DiscordRPC
+    if (Config::enableDiscordPresence) {
+        InitDiscordRPC();
+        Log("[Discord] Rich Presence enabled (can disable in ini: EnableDiscordPresence=false)\n");
+    } else {
+        Log("[Discord] Rich Presence disabled in config\n");
+    }
+
     if (Config::enableConsole) {
         InitConsole();
 
@@ -2008,6 +2117,9 @@ static bool Initialize() {
 static void Shutdown() {
     g_running = false;
     g_fileWatcher.Stop();
+    if (Config::enableDiscordPresence) {
+        ShutdownDiscordRPC();
+    }
 
     if (g_hotkeyThread) {
         WaitForSingleObject(g_hotkeyThread, 1000);
