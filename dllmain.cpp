@@ -1482,13 +1482,20 @@ static char __fastcall LiteLoad_Hook(void* pThis, void* edx, const char* path, u
             g_currentLabel.clear();
 
             std::string display;
-            if (filename == "title")
-            {
+            if (filename == "title") {
                 display = "Main Menu";
             }
-            else if (g_currentLabel.empty())
-            {
-                display = "Loading...";
+            else if (filename == "CgMode") {
+                display = "CG Gallery";
+            }
+            else if (filename == "Replay") {
+                display = "Scene Replay";
+            }
+            else if (filename == "MusicMode") {
+                display = "Music Room";
+            }
+            else if (filename == "ExtraMode") {
+                display = "Extras Menu";
             }
 
             UpdateChapterPresence(display);
