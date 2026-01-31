@@ -1,4 +1,4 @@
-﻿#define WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <objbase.h>
 #include <Psapi.h>
@@ -14,7 +14,7 @@
 #include <vector>
 #include <functional>
 #include <atomic>
-#include <chrono>
+#include <chrono> 
 #include <MinHook.h>
 #include <discord_rpc.h>
 
@@ -84,6 +84,10 @@ namespace Config {
     bool enableAssetRedirect = true;
     bool logAssetRedirects = false;
     char tlAssetsPath[MAX_PATH] = ".\\tl\\assets\\";
+
+    // Debug
+    bool enableDebugMode = false;
+    bool enableGameDebugOutput = false;
 }
 
 //=============================================================================
@@ -149,6 +153,15 @@ static void SaveDefaultConfig() {
     fprintf(f, "Path=.\\tl\\assets\\\n");
     fprintf(f, "\n");
 
+
+    fprintf(f, "[Debug]\n");
+    fprintf(f, "; Enable game debug mode on startup\n");
+    fprintf(f, "EnableDebugMode=false\n");
+    fprintf(f, "\n");
+    fprintf(f, "; Show game's internal debug output in console\n");
+    fprintf(f, "EnableGameDebugOutput=false\n");
+    fprintf(f, "\n");
+
     fclose(f);
 }
 
@@ -174,6 +187,18 @@ static void ReadString(const char* section, const char* key, const char* default
 
 // Forward declaration for Log (defined later)
 static void Log(const char* fmt, ...);
+
+//=============================================================================
+// Debug Scene Jump
+//=============================================================================
+namespace DebugJump {
+    static std::mutex g_mutex;
+    static std::string g_pendingScene;
+    static int g_pendingBlockId = 0;
+    static bool g_jumpRequested = false;
+    static void* g_retouchSystem = nullptr;
+    static bool g_debugModeActive = false;
+}
 
 static void LoadConfig() {
     // Auto-generate config if missing
@@ -210,6 +235,13 @@ static void LoadConfig() {
     Config::logAssetRedirects = ReadBool("Assets", "LogRedirects", false);
     ReadString("Assets", "Path", Config::kDefaultTlAssetsPath, Config::tlAssetsPath, sizeof(Config::tlAssetsPath));
 
+    // Debug
+    Config::enableDebugMode = ReadBool("Debug", "EnableDebugMode", false);
+    Config::enableGameDebugOutput = ReadBool("Debug", "EnableGameDebugOutput", false);
+
+    // Initialize debug state from config
+    DebugJump::g_debugModeActive = Config::enableGameDebugOutput;
+
     // Ensure path ends with backslash
     size_t len = strlen(Config::tlAssetsPath);
     if (len > 0 && Config::tlAssetsPath[len - 1] != '\\') {
@@ -231,7 +263,6 @@ static std::atomic<bool> g_discordRunning{false};
 static bool g_presenceTimerSet = false;
 static std::string g_currentChapter = "Loading...";
 static std::chrono::steady_clock::time_point g_presenceStartTime;
-static void Log(const char* fmt, ...);
 
 static const char* DISCORD_CLIENT_ID = "1466328361583251488";
 
@@ -806,6 +837,7 @@ public:
                 }
             }
 
+            // Update Discord Presence with current label
             std::string display = g_currentLabel.c_str();
             size_t bracket = display.rfind(" [");
             if (bracket != std::string::npos) display.erase(bracket);
@@ -1186,17 +1218,6 @@ static void LoadCharIdTable(const char* path) {
 }
 
 //=============================================================================
-// Debug Scene Jump
-//=============================================================================
-namespace DebugJump {
-    static std::mutex g_mutex;
-    static std::string g_pendingScene;
-    static int g_pendingBlockId = 0;
-    static bool g_jumpRequested = false;
-    static void* g_retouchSystem = nullptr;
-}
-
-//=============================================================================
 // Hook: RetouchAdvCharacter::say()
 //=============================================================================
 typedef void(__thiscall* Fn_AdvCharSay)(
@@ -1436,6 +1457,14 @@ static char __fastcall LiteLoad_Hook(void* pThis, void* edx, const char* path, u
     // Capture RetouchSystem pointer
     {
         std::lock_guard<std::mutex> lock(DebugJump::g_mutex);
+
+        // First capture - enable debug mode if configured
+        if (!DebugJump::g_retouchSystem && Config::enableDebugMode && g_liteSetDebugMode) {
+            DebugJump::g_retouchSystem = pThis;
+            g_liteSetDebugMode(pThis, 0x10001);
+            Log("[DEBUG] Auto-enabled debug mode from config\n");
+        }
+
         DebugJump::g_retouchSystem = pThis;
     }
 
@@ -1481,6 +1510,7 @@ static char __fastcall LiteLoad_Hook(void* pThis, void* edx, const char* path, u
             g_currentFile = filename;
             g_currentLabel.clear();
 
+            // Map filename to friendly name for Discord RPC
             std::string display;
             if (filename == "title") {
                 display = "Main Menu";
@@ -1514,17 +1544,16 @@ typedef void(WINAPI* Fn_OutputDebugStringA)(LPCSTR lpOutputString);
 static Fn_OutputDebugStringA g_origOutputDebugStringA = nullptr;
 
 static void WINAPI OutputDebugStringA_Hook(LPCSTR lpOutputString) {
-    // Also send to our console
-    if (lpOutputString && *lpOutputString) {
+    // Only show in console when debug mode is active
+    if (DebugJump::g_debugModeActive && lpOutputString && *lpOutputString) {
         Log("[GAME] %s", lpOutputString);
-        // Add newline if not present
         size_t len = strlen(lpOutputString);
         if (len > 0 && lpOutputString[len-1] != '\n') {
             Log("\n");
         }
     }
 
-    // Still call original (for DebugView if someone uses it)
+    // Always call original
     g_origOutputDebugStringA(lpOutputString);
 }
 
@@ -1807,7 +1836,8 @@ static void ProcessDebugCommand(const std::string& cmd) {
         Log("  list         - List common scenes\n");
         Log("========================\n\n");
     } else if (verb == "debug") {
-        std::string state;iss >> state;
+        std::string state;
+        iss >> state;
 
         std::lock_guard<std::mutex> lock(DebugJump::g_mutex);
 
@@ -1823,15 +1853,18 @@ static void ProcessDebugCommand(const std::string& cmd) {
 
         if (state == "on") {
             g_liteSetDebugMode(DebugJump::g_retouchSystem, 0x10001);
+            DebugJump::g_debugModeActive = true;  // Enable console output
             Log("[DEBUG] Debug mode ENABLED (0x10001)\n");
         } else if (state == "off") {
             g_liteSetDebugMode(DebugJump::g_retouchSystem, 0);
+            DebugJump::g_debugModeActive = false;  // Disable console output
             Log("[DEBUG] Debug mode DISABLED\n");
         } else {
             // Show current state
             DWORD* pSystem = (DWORD*)DebugJump::g_retouchSystem;
-            DWORD currentFlags = pSystem[0x112C / 4];  // offset 0x112C = index 1099
+            DWORD currentFlags = pSystem[0x112C / 4];
             Log("[DEBUG] Current debug flags: 0x%08X\n", currentFlags);
+            Log("[DEBUG] Console output: %s\n", DebugJump::g_debugModeActive ? "ON" : "OFF");
             Log("[DEBUG] Usage: debug on | debug off\n");
         }
     } else if (verb == "stats") {
@@ -1994,7 +2027,7 @@ static bool InstallHooks(HMODULE hResident) {
         }
     }
 
-    // Get liteSetDebugMode function pointer (no hook needed, just call it)
+    // Get liteSetDebugMode function pointer
     g_liteSetDebugMode = (Fn_LiteSetDebugMode)(base + Offsets::LiteSetDebugMode);
     Log("[+] liteSetDebugMode at 0x%p\n", (void*)g_liteSetDebugMode);
 
@@ -2032,7 +2065,7 @@ static bool Initialize() {
     // Load config FIRST (before console init, so we know if console is enabled)
     LoadConfig();
 
-    // Load DiscordRPC
+    // Load DiscordRPC (Added from git)
     if (Config::enableDiscordPresence) {
         InitDiscordRPC();
         Log("[Discord] Rich Presence enabled (can disable in ini: EnableDiscordPresence=false)\n");
@@ -2067,7 +2100,8 @@ static bool Initialize() {
     // Hook OutputDebugStringA to capture game debug output
     if (MH_CreateHookApi(L"kernel32", "OutputDebugStringA",
         (void*)&OutputDebugStringA_Hook, (void**)&g_origOutputDebugStringA) == MH_OK) {
-        MH_EnableHook(MH_ALL_HOOKS);Log("[+] OutputDebugStringA hooked - game debug → console\n");
+        MH_EnableHook(MH_ALL_HOOKS);
+        Log("[+] OutputDebugStringA hooked - game debug → console\n");
     }
 
     // Hook GetGlyphOutlineA
@@ -2136,6 +2170,7 @@ static bool Initialize() {
 static void Shutdown() {
     g_running = false;
     g_fileWatcher.Stop();
+
     if (Config::enableDiscordPresence) {
         ShutdownDiscordRPC();
     }
