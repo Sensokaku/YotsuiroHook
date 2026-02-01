@@ -4,11 +4,17 @@ project(yotsuiro_tl)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Force32-bit & add utf-8
+# Force 32-bit & add utf-8
 if(MSVC)
     set(CMAKE_GENERATOR_PLATFORM Win32)
     add_compile_options(/utf-8)
 endif()
+
+# Static runtime for portability
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+# Enable MASM
+enable_language(ASM_MASM)
 
 # MinHook
 include(FetchContent)
@@ -27,7 +33,9 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(discord-rpc)
 
-# Force static runtime HARD on discord-rpc (override any internal /MD)
+# Force static runtime on dependencies
+set_property(TARGET minhook PROPERTY
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set_property(TARGET discord-rpc PROPERTY
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
@@ -44,20 +52,23 @@ endif()
 # Extra definitions to quiet old code
 target_compile_definitions(discord-rpc PRIVATE
     _CRT_SECURE_NO_WARNINGS
-    _CRT_NONSTDC_NO_DEPRECATE   # helps with some time64 warnings
+    _CRT_NONSTDC_NO_DEPRECATE
 )
 
-# Static runtime for portability (must be set before adding targets that depend on it)
-set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+# Main DLL - winmm proxy
+add_library(winmm SHARED
+    dllmain.cpp
+    proxy.cpp
+    proxy_exports.asm
+)
 
-# Main DLL
-add_library(dinput8 SHARED dllmain.cpp)
-target_link_libraries(dinput8 PRIVATE minhook psapi discord-rpc)
-target_include_directories(dinput8 PRIVATE
+target_link_libraries(winmm PRIVATE minhook psapi discord-rpc)
+target_include_directories(winmm PRIVATE
     ${minhook_SOURCE_DIR}/include
     ${discord-rpc_SOURCE_DIR}/include
 )
 
-# Also force static runtime on minhook
-set_property(TARGET minhook PROPERTY
-    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+# Use module definition file for exports
+set_target_properties(winmm PROPERTIES
+    LINK_FLAGS "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/winmm.def"
+)
