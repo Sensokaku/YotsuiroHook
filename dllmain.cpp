@@ -2432,7 +2432,13 @@ static HWND WINAPI CreateWindowExA_Hook(
     // Convert window title to Unicode
     wchar_t wideTitle[512] = {};
     LPCWSTR pWideTitle = nullptr;
-    if (lpWindowName && lpWindowName[0]) {
+    
+    // Check for custom window title from config
+    if (Config::windowTitle[0] != '\0') {
+        MultiByteToWideChar(CP_UTF8, 0, Config::windowTitle, -1, wideTitle, 512);
+        pWideTitle = wideTitle;
+    } 
+    else if (lpWindowName && lpWindowName[0]) {
         g_origMultiByteToWideChar(932, 0, lpWindowName, -1, wideTitle, 512);
         pWideTitle = wideTitle;
     }
@@ -2456,6 +2462,14 @@ static HWND WINAPI CreateWindowExA_Hook(
 
 static BOOL WINAPI SetWindowTextA_Hook(HWND hWnd, LPCSTR lpString)
 {
+    // Override if custom title set in config
+    if (Config::windowTitle[0] != '\0') {
+        wchar_t wideTitle[256];
+        MultiByteToWideChar(CP_UTF8, 0, Config::windowTitle, -1, wideTitle, 256);
+        DefWindowProcW(hWnd, WM_SETTEXT, 0, (LPARAM)wideTitle);
+        return TRUE;
+    }
+
     if (lpString) {
         // Convert SJIS → Unicode
         int wlen = g_origMultiByteToWideChar(932, 0, lpString, -1, nullptr, 0);
