@@ -1,4 +1,4 @@
-#define WIN32_LEAN_AND_MEAN
+﻿#define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <objbase.h>
 #include <Psapi.h>
@@ -30,8 +30,10 @@ namespace Offsets {
     constexpr uintptr_t SaveDataIsValid  = 0x0004C210; // RetouchSaveDataControl::isValid()
     constexpr uintptr_t SaveDataGetItem  = 0x0004C2E0; // RetouchSaveDataControl::getItem()
     constexpr uintptr_t PrepareQuestion  = 0x000A5A20; // RetouchSystem::prepareQuestion()
+    constexpr uintptr_t CalcIniValue     = 0x000ACCD0; // RetouchSystem::calcIniValue()
     constexpr uintptr_t LiteSetDebugMode = 0x000B20D0; // RetouchSystem::liteSetDebugMode()
     constexpr uintptr_t LiteLoad         = 0x000C11D0; // RetouchSystem::liteLoad()
+    constexpr uintptr_t GetCodePage      = 0x00137030;
 }
 
 //=============================================================================
@@ -63,6 +65,7 @@ namespace Config {
     char untranslatedLog[MAX_PATH] = ".\\tl\\untranslated.tsv";
 
     // General
+    char windowTitle[256] = "";
     bool enableConsole = true;
     bool enableTextLogging = true;
     bool dumpUntranslated = false;
@@ -102,6 +105,9 @@ static void SaveDefaultConfig() {
     fprintf(f, "\n");
 
     fprintf(f, "[General]\n");
+    fprintf(f, "; Window title (empty = keep original Japanese)\n");
+    fprintf(f, "WindowTitle=\n");
+    fprintf(f, "\n");
     fprintf(f, "; Show debug console window\n");
     fprintf(f, "EnableConsole=true\n");
     fprintf(f, "\n");
@@ -208,6 +214,7 @@ static void LoadConfig() {
     }
 
     // General
+    ReadString("General", "WindowTitle", "", Config::windowTitle, sizeof(Config::windowTitle));
     Config::enableConsole = ReadBool("General", "EnableConsole", true);
     Config::enableTextLogging = ReadBool("General", "EnableTextLogging", true);
     Config::dumpUntranslated = ReadBool("General", "DumpUntranslated", false);
@@ -606,6 +613,42 @@ namespace TextFix {
 
         return result;
     }
+}
+
+//=============================================================================
+// Window Title
+//=============================================================================
+static DWORD WINAPI WindowTitleThread(LPVOID) {
+    char className[64] = {};
+    GetPrivateProfileStringA("setting", "CLASS", "ExHIBIT", className, sizeof(className), ".\\ExHIBIT.ini");
+
+    // Game appends ".wndclass" to the class name
+    strcat_s(className, ".wndclass");
+
+    Log("[WINDOW] Looking for class: %s\n", className);
+
+    for (int i = 0; i < 100; i++) {
+        HWND hwnd = FindWindowA(className, nullptr);
+        if (hwnd) {
+            wchar_t wideTitle[256] = {};
+
+            if (Config::windowTitle[0]) {
+                MultiByteToWideChar(CP_UTF8, 0, Config::windowTitle, -1, wideTitle, 256);
+                Log("[WINDOW] Custom: %s\n", Config::windowTitle);
+            } else {
+                char title[256];
+                GetWindowTextA(hwnd, title, 256);
+                MultiByteToWideChar(932, 0, title, -1, wideTitle, 256);
+                Log("[WINDOW] Japanese: %s\n", Encoding::SjisToUtf8(title).c_str());
+            }
+
+            SetWindowTextW(hwnd, wideTitle);
+            return 0;
+        }
+        Sleep(50);
+    }
+    Log("[WINDOW] Timeout!\n");
+    return 1;
 }
 
 //=============================================================================
@@ -1218,6 +1261,17 @@ static void LoadCharIdTable(const char* path) {
 }
 
 //=============================================================================
+// INI Checksum Bypass - Make INI Editable
+//=============================================================================
+typedef unsigned int(__thiscall* Fn_CalcIniValue)(void* pThis);
+static Fn_CalcIniValue g_origCalcIniValue = nullptr;
+
+static unsigned int __fastcall CalcIniValue_Hook(void* pThis, void* edx) {
+    constexpr unsigned int ORIGINAL_CHECKSUM = 0xFC561D8B;
+    return ORIGINAL_CHECKSUM;
+}
+
+//=============================================================================
 // Hook: RetouchAdvCharacter::say()
 //=============================================================================
 typedef void(__thiscall* Fn_AdvCharSay)(
@@ -1574,13 +1628,12 @@ static DWORD WINAPI GetGlyphOutlineA_Hook(
 {
     DWORD result = g_origGetGlyphOutlineA(hdc, uChar, fuFormat, lpgm, cjBuffer, pvBuffer, lpmat2);
 
-    // Fix negative origin.x which breaks the renderer's rect calculations
-    // This affects 'j' and potentially other characters in proportional fonts
+    // Fix negative origin.x
     if (lpgm && pvBuffer && result != GDI_ERROR) {
         if (lpgm->gmptGlyphOrigin.x < 0) {
             int offset = -lpgm->gmptGlyphOrigin.x;
             lpgm->gmptGlyphOrigin.x = 0;
-            lpgm->gmCellIncX += offset;  // Maintain proper spacing
+            lpgm->gmCellIncX += offset;
         }
     }
 
@@ -1600,7 +1653,7 @@ static HFONT WINAPI CreateFontIndirectA_Hook(const LOGFONTA* lf) {
         std::string origName = Encoding::SjisToUtf8(lf->lfFaceName);
         const char* newFont = nullptr;
 
-        // Check for proportional (Ｐ in SJIS =0x820x6F)
+        // Check for proportional (Ｐ in SJIS = 0x820x6F)
         bool isProportional = (strstr(lf->lfFaceName, "\x82\x6F") != nullptr);
 
         if (isProportional) {
@@ -1621,10 +1674,10 @@ static HFONT WINAPI CreateFontIndirectA_Hook(const LOGFONTA* lf) {
             }
         }
 
-        Log("[FONT] %s (h=%d) -> %s\n", origName.c_str(), lf->lfHeight, newFont);
+        Log("[FONT] %s (h=%d, cs=%d) -> %s (cs=128)\n", origName.c_str(), lf->lfHeight, lf->lfCharSet, newFont);
 
         strcpy_s(modified.lfFaceName, newFont);
-        modified.lfCharSet = DEFAULT_CHARSET;
+        modified.lfCharSet = SHIFTJIS_CHARSET;
         return g_origCreateFontIndirectA(&modified);
     }
     return g_origCreateFontIndirectA(lf);
@@ -1817,6 +1870,94 @@ private:
 static FileWatcher g_fileWatcher;
 
 //=============================================================================
+// Locale Independence Hooks
+//=============================================================================
+
+static void ForceCRTJapaneseCodepage() {
+    // Try to call _setmbcp(932) in all loaded CRTs
+    const wchar_t* runtimes[] = {
+        L"msvcr80.dll", L"msvcrt.dll", L"ucrtbase.dll"
+    };
+
+    typedef int(__cdecl* Fn_setmbcp)(int);
+
+    for (const wchar_t* rt : runtimes) {
+        HMODULE hMod = GetModuleHandleW(rt);
+        if (hMod) {
+            Fn_setmbcp pSetmbcp = (Fn_setmbcp)GetProcAddress(hMod, "_setmbcp");
+            if (pSetmbcp) {
+                int result = pSetmbcp(932);
+                Log("[MBCS] Called _setmbcp(932) in %S -> %d\n", rt, result);
+            }
+        }
+    }
+}
+
+// Character Navigation
+typedef LPSTR(WINAPI* Fn_CharPrevA)(LPCSTR lpszStart, LPCSTR lpszCurrent);
+static Fn_CharPrevA g_origCharPrevA = nullptr;
+
+static LPSTR WINAPI CharPrevA_Hook(LPCSTR lpszStart, LPCSTR lpszCurrent) {
+    if (lpszCurrent <= lpszStart)
+        return (LPSTR)lpszStart;LPCSTR p = lpszCurrent - 1;
+
+    // Check if we're in the middle of a 2-byte SJIS char
+    if (p > lpszStart) {
+        unsigned char prev = *(unsigned char*)(p - 1);
+        unsigned char curr = *(unsigned char*)p;
+
+        // If prev is SJIS lead byte and curr is valid trail byte
+        if (((prev >= 0x81 && prev <= 0x9F) || (prev >= 0xE0 && prev <= 0xFC)) &&
+            ((curr >= 0x40 && curr <= 0x7E) || (curr >= 0x80 && curr <= 0xFC))) {
+            return (LPSTR)(p - 1);
+        }
+    }
+
+    return (LPSTR)p;
+}
+
+typedef LPSTR(WINAPI* Fn_CharNextA)(LPCSTR lpsz);
+static Fn_CharNextA g_origCharNextA = nullptr;
+
+static LPSTR WINAPI CharNextA_Hook(LPCSTR lpsz) {
+    if (!lpsz || !*lpsz)
+        return (LPSTR)lpsz;
+
+    unsigned char c = *(unsigned char*)lpsz;
+
+    // SJIS lead byte - skip2 bytes
+    if ((c >= 0x81 && c <= 0x9F) || (c >= 0xE0 && c <= 0xFC)) {
+        if (lpsz[1])
+            return (LPSTR)(lpsz + 2);
+    }
+
+    return (LPSTR)(lpsz + 1);
+}
+
+// System Codepage
+typedef UINT(WINAPI* Fn_GetACP)();
+static Fn_GetACP g_origGetACP = nullptr;
+
+static UINT WINAPI GetACP_Hook() {
+    return 932;// Japanese Shift-JIS
+}
+
+typedef UINT(WINAPI* Fn_GetOEMCP)();
+static Fn_GetOEMCP g_origGetOEMCP = nullptr;
+
+static UINT WINAPI GetOEMCP_Hook() {
+    return 932;
+}
+
+typedef UINT(__cdecl* Fn_GetCodePage)();
+static Fn_GetCodePage g_origGetCodePage = nullptr;
+
+static UINT __cdecl GetCodePage_Hook() {
+    // Always return Japanese Shift-JIS codepage
+    return 932;
+}
+
+//=============================================================================
 // Debug Console Commands
 //=============================================================================
 static void ProcessDebugCommand(const std::string& cmd) {
@@ -1975,6 +2116,18 @@ static bool InstallHooks(HMODULE hResident) {
     uintptr_t base = (uintptr_t)hResident;
     Log("[*] resident.dll base: 0x%p\n", (void*)base);
 
+    ForceCRTJapaneseCodepage();
+
+    // Hook calcIniValue - bypass INI checksum protection
+    {
+        uintptr_t addr = base + Offsets::CalcIniValue;
+        Log("[*] Hooking calcIniValue at 0x%p\n", (void*)addr);
+        if (MH_CreateHook((void*)addr, (void*)&CalcIniValue_Hook, (void**)&g_origCalcIniValue) == MH_OK) {
+            MH_EnableHook((void*)addr);
+            Log("[+] calcIniValue hooked - INI protection bypassed!\n");
+        }
+    }
+
     // Hook RetouchAdvCharacter::say()
     {
         uintptr_t addr = base + Offsets::AdvCharSay;
@@ -2027,6 +2180,16 @@ static bool InstallHooks(HMODULE hResident) {
         }
     }
 
+    // Hook internal codepage getter
+    {
+        uintptr_t addr = base + Offsets::GetCodePage;
+        Log("[*] Hooking codepage getter at 0x%p\n", (void*)addr);
+        if (MH_CreateHook((void*)addr, (void*)&GetCodePage_Hook, (void**)&g_origGetCodePage) == MH_OK) {
+            MH_EnableHook((void*)addr);
+            Log("[+] Codepage getter hooked -> 932 (Japanese)\n");
+        }
+    }
+
     // Get liteSetDebugMode function pointer
     g_liteSetDebugMode = (Fn_LiteSetDebugMode)(base + Offsets::LiteSetDebugMode);
     Log("[+] liteSetDebugMode at 0x%p\n", (void*)g_liteSetDebugMode);
@@ -2065,14 +2228,6 @@ static bool Initialize() {
     // Load config FIRST (before console init, so we know if console is enabled)
     LoadConfig();
 
-    // Load DiscordRPC (Added from git)
-    if (Config::enableDiscordPresence) {
-        InitDiscordRPC();
-        Log("[Discord] Rich Presence enabled (can disable in ini: EnableDiscordPresence=false)\n");
-    } else {
-        Log("[Discord] Rich Presence disabled in config\n");
-    }
-
     if (Config::enableConsole) {
         InitConsole();
 
@@ -2088,6 +2243,17 @@ static bool Initialize() {
     Log("%s\n", Encoding::SjisToUtf8("よついろ★パッショナート！ - Translation Hook").c_str());
     Log("==================================================\n\n");
 
+    // Start window title thread
+    CreateThread(nullptr, 0, WindowTitleThread, nullptr, 0, nullptr);
+
+    // Load DiscordRPC
+    if (Config::enableDiscordPresence) {
+        InitDiscordRPC();
+        Log("[Discord] Rich Presence enabled (can disable in ini: EnableDiscordPresence=false)\n");
+    } else {
+        Log("[Discord] Rich Presence disabled in config\n");
+    }
+
     // Load translations using config paths
     g_translationDB.Load(Config::translationFile, Config::namesFile);
     LoadCharIdTable(Config::charIdFile);
@@ -2095,6 +2261,32 @@ static bool Initialize() {
     if (MH_Initialize() != MH_OK) {
         Log("[!] MinHook init failed\n");
         return false;
+    }
+
+    // Hook GetACP/GetOEMCP
+    if (MH_CreateHookApi(L"kernel32", "GetACP",
+        (void*)&GetACP_Hook, (void**)&g_origGetACP) == MH_OK) {
+        MH_EnableHook(MH_ALL_HOOKS);
+        Log("[+] GetACP hooked -> 932 (Japanese)\n");
+    }
+
+    if (MH_CreateHookApi(L"kernel32", "GetOEMCP",
+        (void*)&GetOEMCP_Hook, (void**)&g_origGetOEMCP) == MH_OK) {
+        MH_EnableHook(MH_ALL_HOOKS);
+        Log("[+] GetOEMCP hooked -> 932 (Japanese)\n");
+    }
+
+    // Hook CharPrevA/CharNextA
+    if (MH_CreateHookApi(L"user32", "CharPrevA",
+        (void*)&CharPrevA_Hook, (void**)&g_origCharPrevA) == MH_OK) {
+        MH_EnableHook(MH_ALL_HOOKS);
+        Log("[+] CharPrevA hooked -> SJIS\n");
+    }
+
+    if (MH_CreateHookApi(L"user32", "CharNextA",
+        (void*)&CharNextA_Hook, (void**)&g_origCharNextA) == MH_OK) {
+        MH_EnableHook(MH_ALL_HOOKS);
+        Log("[+] CharNextA hooked -> SJIS\n");
     }
 
     // Hook OutputDebugStringA to capture game debug output
