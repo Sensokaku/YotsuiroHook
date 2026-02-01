@@ -17,6 +17,7 @@
 #include <chrono> 
 #include <MinHook.h>
 #include <discord_rpc.h>
+#include "proxy.h"
 
 #pragma comment(lib, "psapi.lib")
 
@@ -623,42 +624,6 @@ namespace TextFix {
 
         return result;
     }
-}
-
-//=============================================================================
-// Window Title
-//=============================================================================
-static DWORD WINAPI WindowTitleThread(LPVOID) {
-    char className[64] = {};
-    GetPrivateProfileStringA("setting", "CLASS", "ExHIBIT", className, sizeof(className), ".\\ExHIBIT.ini");
-
-    // Game appends ".wndclass" to the class name
-    strcat_s(className, ".wndclass");
-
-    Log("[WINDOW] Looking for class: %s\n", className);
-
-    for (int i = 0; i < 100; i++) {
-        HWND hwnd = FindWindowA(className, nullptr);
-        if (hwnd) {
-            wchar_t wideTitle[256] = {};
-
-            if (Config::windowTitle[0]) {
-                MultiByteToWideChar(CP_UTF8, 0, Config::windowTitle, -1, wideTitle, 256);
-                Log("[WINDOW] Custom: %s\n", Config::windowTitle);
-            } else {
-                char title[256];
-                GetWindowTextA(hwnd, title, 256);
-                MultiByteToWideChar(932, 0, title, -1, wideTitle, 256);
-                Log("[WINDOW] Japanese: %s\n", Encoding::SjisToUtf8(title).c_str());
-            }
-
-            SetWindowTextW(hwnd, wideTitle);
-            return 0;
-        }
-        Sleep(50);
-    }
-    Log("[WINDOW] Timeout!\n");
-    return 1;
 }
 
 //=============================================================================
@@ -2232,6 +2197,25 @@ static HMODULE WINAPI LoadLibraryExA_Hook(LPCSTR lpLibFileName, HANDLE hFile, DW
 }
 
 //=============================================================================
+// Codepage/Locale Hook Forward Declarations
+//=============================================================================
+typedef int(WINAPI* Fn_MultiByteToWideChar)(UINT, DWORD, LPCCH, int, LPWSTR, int);
+typedef int(WINAPI* Fn_WideCharToMultiByte)(UINT, DWORD, LPCWCH, int, LPSTR, int, LPCCH, LPBOOL);
+static Fn_MultiByteToWideChar g_origMultiByteToWideChar = nullptr;
+static Fn_WideCharToMultiByte g_origWideCharToMultiByte = nullptr;
+
+typedef HWND(WINAPI* Fn_CreateWindowExA)(DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
+static Fn_CreateWindowExA g_origCreateWindowExA = nullptr;
+
+typedef BOOL(WINAPI* Fn_SetWindowTextA)(HWND, LPCSTR);
+static Fn_SetWindowTextA g_origSetWindowTextA = nullptr;
+
+static int WINAPI MultiByteToWideChar_Hook(UINT, DWORD, LPCCH, int, LPWSTR, int);
+static int WINAPI WideCharToMultiByte_Hook(UINT, DWORD, LPCWCH, int, LPSTR, int, LPCCH, LPBOOL);
+static HWND WINAPI CreateWindowExA_Hook(DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
+static BOOL WINAPI SetWindowTextA_Hook(HWND, LPCSTR);
+
+//=============================================================================
 // Initialization
 //=============================================================================
 static bool Initialize() {
@@ -2254,9 +2238,6 @@ static bool Initialize() {
     Log("%s - Translation Hook\n", base_title);
     Log("==================================================\n\n");
 
-    // Start window title thread
-    CreateThread(nullptr, 0, WindowTitleThread, nullptr, 0, nullptr);
-
     // Load DiscordRPC
     if (Config::enableDiscordPresence) {
         InitDiscordRPC();
@@ -2274,30 +2255,50 @@ static bool Initialize() {
         return false;
     }
 
+    //=========================================================================
+    // Locale/Codepage Hooks - Fix Japanese window titles on non-JP systems
+    //=========================================================================
+    if (MH_CreateHookApi(L"kernelbase", "MultiByteToWideChar",
+        (void*)&MultiByteToWideChar_Hook, (void**)&g_origMultiByteToWideChar) == MH_OK) {
+        Log("[LOCALE] MultiByteToWideChar hooked (CP_ACP -> CP932)\n");
+    }
+    if (MH_CreateHookApi(L"kernelbase", "WideCharToMultiByte",
+        (void*)&WideCharToMultiByte_Hook, (void**)&g_origWideCharToMultiByte) == MH_OK) {
+        Log("[LOCALE] WideCharToMultiByte hooked (CP_ACP -> CP932)\n");
+    }
+    if (MH_CreateHookApi(L"user32", "CreateWindowExA",
+        (void*)&CreateWindowExA_Hook, (void**)&g_origCreateWindowExA) == MH_OK) {
+        Log("[LOCALE] CreateWindowExA hooked (-> Unicode + DefWindowProcW)\n");
+    }
+    if (MH_CreateHookApi(L"user32", "SetWindowTextA",
+        (void*)&SetWindowTextA_Hook, (void**)&g_origSetWindowTextA) == MH_OK) {
+        Log("[LOCALE] SetWindowTextA hooked (-> DefWindowProcW)\n");
+    }
+
     // Hook GetACP/GetOEMCP
     if (MH_CreateHookApi(L"kernel32", "GetACP",
         (void*)&GetACP_Hook, (void**)&g_origGetACP) == MH_OK) {
         MH_EnableHook(MH_ALL_HOOKS);
-        Log("[+] GetACP hooked -> 932 (Japanese)\n");
+        Log("[LOCALE] GetACP hooked -> 932 (Japanese)\n");
     }
 
     if (MH_CreateHookApi(L"kernel32", "GetOEMCP",
         (void*)&GetOEMCP_Hook, (void**)&g_origGetOEMCP) == MH_OK) {
         MH_EnableHook(MH_ALL_HOOKS);
-        Log("[+] GetOEMCP hooked -> 932 (Japanese)\n");
+        Log("[LOCALE] GetOEMCP hooked -> 932 (Japanese)\n");
     }
 
     // Hook CharPrevA/CharNextA
     if (MH_CreateHookApi(L"user32", "CharPrevA",
         (void*)&CharPrevA_Hook, (void**)&g_origCharPrevA) == MH_OK) {
         MH_EnableHook(MH_ALL_HOOKS);
-        Log("[+] CharPrevA hooked -> SJIS\n");
+        Log("[LOCALE] CharPrevA hooked -> SJIS\n");
     }
 
     if (MH_CreateHookApi(L"user32", "CharNextA",
         (void*)&CharNextA_Hook, (void**)&g_origCharNextA) == MH_OK) {
         MH_EnableHook(MH_ALL_HOOKS);
-        Log("[+] CharNextA hooked -> SJIS\n");
+        Log("[LOCALE] CharNextA hooked -> SJIS\n");
     }
 
     // Hook OutputDebugStringA to capture game debug output
@@ -2393,16 +2394,124 @@ static void Shutdown() {
 }
 
 //=============================================================================
-// ASI Entry Point (no DLL proxy needed)
+// Codepage Hook Functions
 //=============================================================================
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
+static int WINAPI MultiByteToWideChar_Hook(
+    UINT CodePage, DWORD dwFlags, LPCCH lpMultiByteStr, int cbMultiByte,
+    LPWSTR lpWideCharStr, int cchWideChar)
+{
+    // Force CP_ACP/CP_OEMCP to Japanese
+    if (CodePage == CP_ACP || CodePage == CP_OEMCP) {
+        CodePage = 932;
+    }
+    return g_origMultiByteToWideChar(CodePage, dwFlags, lpMultiByteStr, cbMultiByte,
+        lpWideCharStr, cchWideChar);
+}
+
+static int WINAPI WideCharToMultiByte_Hook(
+    UINT CodePage, DWORD dwFlags, LPCWCH lpWideCharStr, int cchWideChar,
+    LPSTR lpMultiByteStr, int cbMultiByte, LPCCH lpDefaultChar, LPBOOL lpUsedDefaultChar)
+{
+    if (CodePage == CP_ACP || CodePage == CP_OEMCP) {
+        CodePage = 932;
+    }
+    return g_origWideCharToMultiByte(CodePage, dwFlags, lpWideCharStr, cchWideChar,
+        lpMultiByteStr, cbMultiByte, lpDefaultChar, lpUsedDefaultChar);
+}
+
+//=============================================================================
+// CreateWindowExA Hook - Create windows with Unicode title
+//=============================================================================
+static HWND WINAPI CreateWindowExA_Hook(
+    DWORD dwExStyle, LPCSTR lpClassName, LPCSTR lpWindowName, DWORD dwStyle,
+    int x, int y, int nWidth, int nHeight,
+    HWND hWndParent, HMENU hMenu, HINSTANCE hInstance, LPVOID lpParam)
+{
+    // Convert class name to Unicode (handle ATOM case)
+    wchar_t wideClassName[256] = {};
+    LPCWSTR pWideClassName = nullptr;
+    if (lpClassName) {
+        if ((uintptr_t)lpClassName <= 0xFFFF) {
+            // It's an ATOM, pass as-is
+            pWideClassName = (LPCWSTR)lpClassName;
+        } else {
+            g_origMultiByteToWideChar(932, 0, lpClassName, -1, wideClassName, 256);
+            pWideClassName = wideClassName;
+        }
+    }
+
+    // Convert window title to Unicode
+    wchar_t wideTitle[512] = {};
+    LPCWSTR pWideTitle = nullptr;
+    
+    // Check for custom window title from config
+    if (Config::windowTitle[0] != '\0') {
+        MultiByteToWideChar(CP_UTF8, 0, Config::windowTitle, -1, wideTitle, 512);
+        pWideTitle = wideTitle;
+    } 
+    else if (lpWindowName && lpWindowName[0]) {
+        g_origMultiByteToWideChar(932, 0, lpWindowName, -1, wideTitle, 512);
+        pWideTitle = wideTitle;
+    }
+
+    // Create window using Unicode API
+    HWND result = CreateWindowExW(dwExStyle, pWideClassName, pWideTitle, dwStyle,
+        x, y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
+
+    // Force-set the window text using DefWindowProcW
+    // This bypasses the ANSI WndProc and sets Unicode text directly
+    if (result && pWideTitle) {
+        DefWindowProcW(result, WM_SETTEXT, 0, (LPARAM)pWideTitle);
+    }
+
+    return result;
+}
+
+//=============================================================================
+// SetWindowTextA Hook - Title often set AFTER window creation
+//=============================================================================
+
+static BOOL WINAPI SetWindowTextA_Hook(HWND hWnd, LPCSTR lpString)
+{
+    // Override if custom title set in config
+    if (Config::windowTitle[0] != '\0') {
+        wchar_t wideTitle[256];
+        MultiByteToWideChar(CP_UTF8, 0, Config::windowTitle, -1, wideTitle, 256);
+        DefWindowProcW(hWnd, WM_SETTEXT, 0, (LPARAM)wideTitle);
+        return TRUE;
+    }
+
+    if (lpString) {
+        // Convert SJIS → Unicode
+        int wlen = g_origMultiByteToWideChar(932, 0, lpString, -1, nullptr, 0);
+        if (wlen > 0) {
+            wchar_t* wstr = (wchar_t*)_alloca(wlen * sizeof(wchar_t));
+            g_origMultiByteToWideChar(932, 0, lpString, -1, wstr, wlen);
+            // Use DefWindowProcW to bypass ANSI WndProc
+            DefWindowProcW(hWnd, WM_SETTEXT, 0, (LPARAM)wstr);
+            return TRUE;
+        }
+    }
+    return g_origSetWindowTextA(hWnd, lpString);
+}
+
+//=============================================================================
+// winmm.dll Proxy Entry Point
+//=============================================================================
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
     switch (reason) {
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hModule);
+
+        proxy_init();
         Initialize();
         break;
+
     case DLL_PROCESS_DETACH:
-        Shutdown();
+        if (!lpReserved) {
+            Shutdown();
+            proxy_free();
+        }
         break;
     }
     return TRUE;
