@@ -4,9 +4,10 @@ project(yotsuiro_tl)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Force 32-bit
+# Force 32-bit & add utf-8
 if(MSVC)
     set(CMAKE_GENERATOR_PLATFORM Win32)
+    add_compile_options(/utf-8)
 endif()
 
 # Static runtime for portability
