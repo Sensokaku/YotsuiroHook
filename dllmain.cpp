@@ -359,7 +359,17 @@ static std::mutex g_logMutex;
 static void InitConsole() {
     if (!Config::enableConsole) return;
     AllocConsole();
-    SetConsoleTitleW(L"よついろ★パッショナート！ - Translation Hook");
+    std::wstring title = L"Translation Hook";
+    if (Config::windowTitle[0]) {
+        std::string narrow = Config::windowTitle;
+        narrow += " - Translation Hook";
+        int len = MultiByteToWideChar(CP_UTF8, 0, narrow.c_str(), -1, nullptr, 0);
+        title.resize(len);
+        MultiByteToWideChar(CP_UTF8, 0, narrow.c_str(), -1, &title[0], len);
+    } else {
+        title = L"よついろ★パッショナート！ - Translation Hook";
+    }
+    SetConsoleTitleW(title.c_str());
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
     freopen_s(&g_logFile, "CONOUT$", "w", stdout);
@@ -2239,8 +2249,9 @@ static bool Initialize() {
         CreateThread(nullptr, 0, ConsoleInputThread, nullptr, 0, nullptr);
     }
 
+    const char* base_title = Config::windowTitle[0] ? Config::windowTitle : "よついろ★パッショナート！";
     Log("==================================================\n");
-    Log("%s\n", Encoding::SjisToUtf8("よついろ★パッショナート！ - Translation Hook").c_str());
+    Log("%s - Translation Hook\n", base_title);
     Log("==================================================\n\n");
 
     // Start window title thread
