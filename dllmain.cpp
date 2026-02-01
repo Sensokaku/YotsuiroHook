@@ -874,6 +874,18 @@ public:
         return nullptr;
     }
 
+    // Simple lookup for UI elements (dialogs, buttons) - no logging or tracking
+    const std::string* FindUITranslation(const char* sjisText) {
+        if (!sjisText || !*sjisText) return nullptr;
+
+        std::string utf8Key = Encoding::SjisToUtf8(sjisText);
+        if (utf8Key.empty()) return nullptr;
+
+        std::lock_guard<std::mutex> lock(m_dataMutex);
+        auto it = m_messages.find(utf8Key);
+        return (it != m_messages.end()) ? &it->second : nullptr;
+    }
+
     // Label
     const std::string* FindLabelTranslation(const char* sjisLabel) {
         if (!sjisLabel || !*sjisLabel) return nullptr;
@@ -2178,6 +2190,68 @@ static bool InstallHooks(HMODULE hResident) {
     return true;
 }
 
+//=============================================================================
+// DialogBoxParamA Hook - Translate resource-based dialogs
+//=============================================================================
+typedef INT_PTR(WINAPI* Fn_DialogBoxParamA)(HINSTANCE, LPCSTR, HWND, DLGPROC, LPARAM);
+static Fn_DialogBoxParamA g_origDialogBoxParamA = nullptr;
+
+// Callback to translate each child control in dialog
+static BOOL CALLBACK TranslateDialogChildProc(HWND hwnd, LPARAM lParam) {
+    char text[256];
+    if (GetWindowTextA(hwnd, text, sizeof(text)) > 0 && text[0]) {
+        // Try to find translation
+        const std::string* translation = g_translationDB.FindUITranslation(text);
+        if (translation) {
+            // Convert UTF-8 translation to Unicode and set
+            wchar_t wideText[256];
+            MultiByteToWideChar(CP_UTF8, 0, translation->c_str(), -1, wideText, 256);
+            SetWindowTextW(hwnd, wideText);
+        }
+    }
+    return TRUE; // Continue enumeration
+}
+
+static INT_PTR WINAPI DialogBoxParamA_Hook(
+    HINSTANCE hInstance, LPCSTR lpTemplateName, HWND hWndParent,
+    DLGPROC lpDialogFunc, LPARAM dwInitParam)
+{
+    // Install a temporary CBT hook to translate dialog when it activates
+    static HHOOK s_cbtHook = nullptr;
+    
+    auto cbtProc = [](int nCode, WPARAM wParam, LPARAM lParam) -> LRESULT {
+        if (nCode == HCBT_ACTIVATE) {
+            HWND hwnd = (HWND)wParam;
+            
+            // Translate dialog title
+            char title[256];
+            if (GetWindowTextA(hwnd, title, sizeof(title)) > 0 && title[0]) {
+                const std::string* translation = g_translationDB.FindUITranslation(title);
+                if (translation) {
+                    wchar_t wideTitle[256];
+                    MultiByteToWideChar(CP_UTF8, 0, translation->c_str(), -1, wideTitle, 256);
+                    SetWindowTextW(hwnd, wideTitle);
+                }
+            }
+            
+            // Translate all child controls
+            EnumChildWindows(hwnd, TranslateDialogChildProc, 0);
+        }
+        return CallNextHookEx(s_cbtHook, nCode, wParam, lParam);
+    };
+    
+    s_cbtHook = SetWindowsHookExW(WH_CBT, cbtProc, nullptr, GetCurrentThreadId());
+    
+    INT_PTR result = g_origDialogBoxParamA(hInstance, lpTemplateName, hWndParent, lpDialogFunc, dwInitParam);
+    
+    if (s_cbtHook) {
+        UnhookWindowsHookEx(s_cbtHook);
+        s_cbtHook = nullptr;
+    }
+    
+    return result;
+}
+
 
 static HMODULE WINAPI LoadLibraryExA_Hook(LPCSTR lpLibFileName, HANDLE hFile, DWORD dwFlags) {
     HMODULE result = g_origLoadLibraryExA(lpLibFileName, hFile, dwFlags);
@@ -2195,6 +2269,7 @@ static HMODULE WINAPI LoadLibraryExA_Hook(LPCSTR lpLibFileName, HANDLE hFile, DW
 
     return result;
 }
+
 
 //=============================================================================
 // Codepage/Locale Hook Forward Declarations
@@ -2234,6 +2309,7 @@ static bool Initialize() {
     }
 
     const char* base_title = Config::windowTitle[0] ? Config::windowTitle : "よついろ★パッショナート！";
+
     Log("==================================================\n");
     Log("%s - Translation Hook\n", base_title);
     Log("==================================================\n\n");
@@ -2273,6 +2349,10 @@ static bool Initialize() {
     if (MH_CreateHookApi(L"user32", "SetWindowTextA",
         (void*)&SetWindowTextA_Hook, (void**)&g_origSetWindowTextA) == MH_OK) {
         Log("[LOCALE] SetWindowTextA hooked (-> DefWindowProcW)\n");
+    }
+    if (MH_CreateHookApi(L"user32", "DialogBoxParamA",
+        (void*)&DialogBoxParamA_Hook, (void**)&g_origDialogBoxParamA) == MH_OK) {
+        Log("[DIALOG] DialogBoxParamA hooked (for UI translation)\n");
     }
 
     // Hook GetACP/GetOEMCP
@@ -2422,6 +2502,8 @@ static int WINAPI WideCharToMultiByte_Hook(
 //=============================================================================
 // CreateWindowExA Hook - Create windows with Unicode title
 //=============================================================================
+static HWND g_mainGameWindow = nullptr;
+
 static HWND WINAPI CreateWindowExA_Hook(
     DWORD dwExStyle, LPCSTR lpClassName, LPCSTR lpWindowName, DWORD dwStyle,
     int x, int y, int nWidth, int nHeight,
@@ -2440,17 +2522,28 @@ static HWND WINAPI CreateWindowExA_Hook(
         }
     }
 
-    // Convert window title to Unicode
+    // Convert window title to Unicode (with optional translation)
     wchar_t wideTitle[512] = {};
     LPCWSTR pWideTitle = nullptr;
     
-    // Check for custom window title from config
-    if (Config::windowTitle[0] != '\0') {
+    // Only apply custom title to main window (top-level, has title, no parent)
+    bool isMainWindow = (hWndParent == nullptr) && lpWindowName && lpWindowName[0];
+    
+    if (isMainWindow && Config::windowTitle[0] != '\0') {
+        // Custom window title from config
         MultiByteToWideChar(CP_UTF8, 0, Config::windowTitle, -1, wideTitle, 512);
         pWideTitle = wideTitle;
     } 
     else if (lpWindowName && lpWindowName[0]) {
-        g_origMultiByteToWideChar(932, 0, lpWindowName, -1, wideTitle, 512);
+        // Try to find UI translation (for dialogs, buttons, etc.)
+        const std::string* uiTranslation = g_translationDB.FindUITranslation(lpWindowName);
+        if (uiTranslation) {
+            // Found translation - convert UTF-8 to Unicode
+            MultiByteToWideChar(CP_UTF8, 0, uiTranslation->c_str(), -1, wideTitle, 512);
+        } else {
+            // No translation - just convert SJIS to Unicode
+            g_origMultiByteToWideChar(932, 0, lpWindowName, -1, wideTitle, 512);
+        }
         pWideTitle = wideTitle;
     }
 
@@ -2464,6 +2557,11 @@ static HWND WINAPI CreateWindowExA_Hook(
         DefWindowProcW(result, WM_SETTEXT, 0, (LPARAM)pWideTitle);
     }
 
+    // Track main window for SetWindowTextA filtering
+    if (result && isMainWindow && g_mainGameWindow == nullptr) {
+        g_mainGameWindow = result;
+    }
+
     return result;
 }
 
@@ -2473,8 +2571,8 @@ static HWND WINAPI CreateWindowExA_Hook(
 
 static BOOL WINAPI SetWindowTextA_Hook(HWND hWnd, LPCSTR lpString)
 {
-    // Override if custom title set in config
-    if (Config::windowTitle[0] != '\0') {
+    // Only override main game window with custom title (not dialogs)
+    if (Config::windowTitle[0] != '\0' && hWnd == g_mainGameWindow) {
         wchar_t wideTitle[256];
         MultiByteToWideChar(CP_UTF8, 0, Config::windowTitle, -1, wideTitle, 256);
         DefWindowProcW(hWnd, WM_SETTEXT, 0, (LPARAM)wideTitle);
